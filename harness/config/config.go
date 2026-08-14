@@ -12,8 +12,9 @@ var (
 )
 
 type Config struct {
-	IgnoreFile string
-	HotReload  bool
+	IgnoreFile    string
+	HotReload     bool
+	CustomToolDir string
 }
 
 func GetConfig() *Config {
@@ -44,4 +45,5 @@ func loadConfig() {
 
 	config.IgnoreFile = viper.GetString("ignore-file")
 	config.HotReload = viper.GetBool("hot-reload")
+	config.CustomToolDir = viper.GetString("custom-tool-dir")
 }

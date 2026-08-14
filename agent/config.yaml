@@ -1,2 +1,3 @@
-hot-reload: false # enables hot reload for configs as well as other files
+hot-reload: true # enables hot reload for configs as well as other files
 ignore-file: "Z:\\harness-go\\agent\\.ignore"
+custom-tool-dir: "agent\\custom_tools"

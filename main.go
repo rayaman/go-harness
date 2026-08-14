@@ -18,18 +18,21 @@ package main
 
 import (
 	"ai-harness/harness"
+	"ai-harness/harness/config"
 	luatool "ai-harness/harness/lua-tool"
 	"ai-harness/harness/tools"
 	"bufio"
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
 
 func main() {
 	cfg := harness.DefaultConfig()
+	conf := config.GetConfig()
 
 	// --- Edit these to point at a different model/server -------------
 	// cfg.Model = "qwen2.5:14b"
@@ -68,16 +71,39 @@ func main() {
 	registry.Register(tools.EditFileTool{BaseDir: "."})
 	registry.Register(tools.WriteFileTool{BaseDir: "."})
 
-	data, err := os.ReadFile("agent/custom_tools/script.lua")
-	if err != nil {
-		panic(err)
+	// --- Dynamic Custom Lua Tools Loader -------------------------------
+	defaultConfigDir := "agent/custom_tools"
+	if conf.CustomToolDir != "" {
+		defaultConfigDir = conf.CustomToolDir
 	}
-	tool, err := luatool.NewLuaToolFromScript(string(data))
+	customToolsDir := defaultConfigDir
+	entries, err := os.ReadDir(customToolsDir)
 	if err != nil {
-		panic(err)
+		fmt.Printf("Note: Skipping custom Lua tools (could not read directory %q: %v)\n", customToolsDir, err)
+	} else {
+		for _, entry := range entries {
+			// Skip subdirectories and non-Lua files
+			if entry.IsDir() || filepath.Ext(entry.Name()) != ".lua" {
+				continue
+			}
+
+			scriptPath := filepath.Join(customToolsDir, entry.Name())
+			data, err := os.ReadFile(scriptPath)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to read custom tool %s: %v\n", scriptPath, err)
+				continue
+			}
+
+			tool, err := luatool.NewLuaToolFromScript(string(data))
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to parse Lua tool %s: %v\n", scriptPath, err)
+				continue
+			}
+
+			registry.Register(tool)
+			fmt.Printf("Loaded custom Lua tool: %s\n", entry.Name())
+		}
 	}
-	registry.Register(tool)
-	// registry.Register(mytools.WebSearchTool{APIKey: os.Getenv("SEARCH_KEY")})
 
 	h := harness.New(cfg, client, registry)
 
@@ -102,6 +128,12 @@ func main() {
 			break
 		}
 
+		// --- Hot Reload Check ---
+		// Automatically picks up edits or newly created scripts before every prompt
+		if conf.HotReload {
+			reloadLuaTools(customToolsDir, registry)
+		}
+
 		reply, err := h.Ask(ctx, input)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -124,6 +156,46 @@ func main() {
 		default:
 			fmt.Printf("[context: %d prompt + %d completion = %d tokens]\n",
 				h.LastUsage.PromptTokens, h.LastUsage.CompletionTokens, h.LastUsage.TotalTokens)
+		}
+	}
+}
+
+var luaModTimes = make(map[string]time.Time)
+
+func reloadLuaTools(dir string, registry *harness.Registry) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".lua" {
+			continue
+		}
+
+		path := filepath.Join(dir, entry.Name())
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+
+		lastMod, known := luaModTimes[path]
+		// If new file OR modified since last check
+		if !known || info.ModTime().After(lastMod) {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "[hot-reload error reading %s]: %v\n", entry.Name(), err)
+				continue
+			}
+
+			tool, err := luatool.NewLuaToolFromScript(string(data))
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "[hot-reload syntax error in %s]: %v\n", entry.Name(), err)
+				continue
+			}
+
+			registry.Register(tool)
+			luaModTimes[path] = info.ModTime()
 		}
 	}
 }
