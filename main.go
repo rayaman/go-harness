@@ -17,15 +17,15 @@
 package main
 
 import (
+	"ai-harness/harness"
+	luatool "ai-harness/harness/lua-tool"
+	"ai-harness/harness/tools"
 	"bufio"
 	"context"
 	"fmt"
 	"os"
 	"strings"
 	"time"
-
-	"ai-harness/harness"
-	"ai-harness/harness/tools"
 )
 
 func main() {
@@ -62,6 +62,21 @@ func main() {
 	registry := harness.NewRegistry()
 	registry.Register(tools.CurrentTimeTool{})
 	registry.Register(tools.ReadFileTool{BaseDir: "."})
+	registry.Register(tools.ListFilesTool{BaseDir: "."})
+	registry.Register(tools.ReadPartialFileTool{BaseDir: "."})
+	registry.Register(tools.GetFileSizeTool{BaseDir: "."})
+	registry.Register(tools.EditFileTool{BaseDir: "."})
+	registry.Register(tools.WriteFileTool{BaseDir: "."})
+
+	data, err := os.ReadFile("agent/custom_tools/script.lua")
+	if err != nil {
+		panic(err)
+	}
+	tool, err := luatool.NewLuaToolFromScript(string(data))
+	if err != nil {
+		panic(err)
+	}
+	registry.Register(tool)
 	// registry.Register(mytools.WebSearchTool{APIKey: os.Getenv("SEARCH_KEY")})
 
 	h := harness.New(cfg, client, registry)
@@ -69,6 +84,9 @@ func main() {
 	fmt.Printf("ai-harness ready - model %q at %s. Type 'exit' to quit.\n", cfg.Model, cfg.BaseURL)
 
 	scanner := bufio.NewScanner(os.Stdin)
+	if err := scanner.Err(); err != nil {
+		panic(err)
+	}
 	ctx := context.Background()
 
 	for {
@@ -90,19 +108,22 @@ func main() {
 			continue
 		}
 		fmt.Println(reply)
-		if h.LastUsage.TotalTokens > 0 {
-			if cfg.MaxContextTokens > 0 {
-				pct := 100 * h.LastUsage.PromptTokens / cfg.MaxContextTokens
-				fmt.Println(pct)
-				fmt.Printf("[context: %d / %d tokens (%d%%)]\n",
-					h.LastUsage.PromptTokens, cfg.MaxContextTokens, pct)
-				if pct >= 80 {
-					fmt.Println("[warning: approaching context limit - consider trimming history]")
-				}
-			} else {
-				fmt.Printf("[context: %d prompt + %d completion = %d tokens]\n",
-					h.LastUsage.PromptTokens, h.LastUsage.CompletionTokens, h.LastUsage.TotalTokens)
+		switch {
+		case h.LastUsage.TotalTokens == 0:
+			// This is the "nothing printed" case - the server's response
+			// simply didn't include a usage field. Not every
+			// OpenAI-compatible server populates this for every request.
+			fmt.Println("[context: this server didn't report token usage]")
+		case cfg.MaxContextTokens > 0:
+			pct := 100 * h.LastUsage.PromptTokens / cfg.MaxContextTokens
+			fmt.Printf("[context: %d / %d tokens (%d%%)]\n",
+				h.LastUsage.PromptTokens, cfg.MaxContextTokens, pct)
+			if pct >= 80 {
+				fmt.Println("[warning: approaching context limit - consider trimming history]")
 			}
+		default:
+			fmt.Printf("[context: %d prompt + %d completion = %d tokens]\n",
+				h.LastUsage.PromptTokens, h.LastUsage.CompletionTokens, h.LastUsage.TotalTokens)
 		}
 	}
 }

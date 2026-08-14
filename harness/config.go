@@ -61,6 +61,6 @@ func DefaultConfig() Config {
 		Model:             "llama3.1",
 		SystemPrompt:      "You are a helpful assistant running locally on the user's machine. Use tools when they help you answer accurately, and say so plainly when you don't know something.",
 		Temperature:       0.7,
-		MaxToolIterations: 6,
+		MaxToolIterations: 100,
 	}
 }
