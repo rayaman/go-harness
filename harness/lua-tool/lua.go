@@ -15,12 +15,30 @@ type LuaTool struct {
 	script string
 }
 
+// FilesystemConfig defines security boundaries for Lua file operations.
+type FilesystemConfig struct {
+	BaseDir string
+}
+
+// DefaultFilesystemConfig provides secure default settings.
+var DefaultFilesystemConfig = FilesystemConfig{
+	BaseDir: ".",
+}
+
 // NewLuaToolFromScript initializes a new tool from a Lua script string.
 func NewLuaToolFromScript(script string) (*LuaTool, error) {
+	return NewLuaToolFromScriptWithConfig(script, DefaultFilesystemConfig)
+}
+
+// NewLuaToolFromScriptWithConfig initializes a new tool with custom filesystem configuration.
+func NewLuaToolFromScriptWithConfig(script string, fsCfg FilesystemConfig) (*LuaTool, error) {
 	L := lua.NewState()
 
 	// Enable the safe HTTP module
 	RegisterHTTPModule(L, DefaultHTTPConfig)
+
+	// Enable the safe filesystem module
+	RegisterFilesystemModule(L, fsCfg)
 
 	if err := L.DoString(script); err != nil {
 		L.Close()

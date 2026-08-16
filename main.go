@@ -31,7 +31,7 @@ import (
 )
 
 func main() {
-	cfg := harness.DefaultConfig()
+	cfg := harness.TestConfig()
 	conf := config.GetConfig()
 
 	// --- Edit these to point at a different model/server -------------
@@ -39,14 +39,6 @@ func main() {
 	// cfg.BaseURL = "http://localhost:8080/v1" // e.g. llama.cpp server
 	// cfg.Temperature = 0.2
 	// -------------------------------------------------------------------
-
-	// Read the API key from an environment variable rather than hardcoding
-	// it - keeps secrets out of source control. Set it before running, e.g.:
-	//   export AI_HARNESS_API_KEY=sk-...
-	// Leave it unset for local servers that don't require auth.
-	cfg.APIKey = "sk-unsloth-94d524b13d50f995c58cbb5d08c090c3" //os.Getenv("AI_HARNESS_API_KEY")
-	cfg.BaseURL = "http://192.168.1.235:8810/v1"
-	cfg.Model = "qwen3-coder-next-gguf"
 
 	client := harness.NewClient(cfg.BaseURL, cfg.APIKey)
 
@@ -94,7 +86,7 @@ func main() {
 				continue
 			}
 
-			tool, err := luatool.NewLuaToolFromScript(string(data))
+			tool, err := luatool.NewLuaToolFromScriptWithConfig(string(data), luatool.FilesystemConfig{BaseDir: "."})
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to parse Lua tool %s: %v\n", scriptPath, err)
 				continue
@@ -188,7 +180,7 @@ func reloadLuaTools(dir string, registry *harness.Registry) {
 				continue
 			}
 
-			tool, err := luatool.NewLuaToolFromScript(string(data))
+			tool, err := luatool.NewLuaToolFromScriptWithConfig(string(data), luatool.FilesystemConfig{BaseDir: "."})
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "[hot-reload syntax error in %s]: %v\n", entry.Name(), err)
 				continue

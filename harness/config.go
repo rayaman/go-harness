@@ -57,10 +57,21 @@ type Config struct {
 // server/model - no need to edit this function itself.
 func DefaultConfig() Config {
 	return Config{
-		BaseURL:           "http://localhost:11434/v1",
-		Model:             "llama3.1",
+		BaseURL:           "http://192.168.1.235:8810/v1",
+		Model:             "qwen3-coder-next-gguf",
 		SystemPrompt:      "You are a helpful assistant running locally on the user's machine. Use tools when they help you answer accurately, and say so plainly when you don't know something.",
 		Temperature:       0.7,
 		MaxToolIterations: 100,
+	}
+}
+
+func TestConfig() Config {
+	return Config{
+		BaseURL:           "http://192.168.1.235:8810/v1",
+		Model:             "qwen3-coder-next-gguf",
+		SystemPrompt:      "You are a helpful assistant running locally on the user's machine. Use tools when they help you answer accurately, and say so plainly when you don't know something.",
+		Temperature:       0.7,
+		MaxToolIterations: 100,
+		APIKey:            "sk-unsloth-94d524b13d50f995c58cbb5d08c090c3",
 	}
 }
