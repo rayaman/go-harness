@@ -1,22 +1,7 @@
-// ai-harness is a minimal, hackable harness for talking to a local LLM
-// server (Ollama, llama.cpp, LM Studio, etc.) with tool-calling support.
-//
-// The design is intentionally simple and split into small pieces so you
-// can edit any one part without needing to understand the whole thing:
-//
-//	harness/types.go   - the wire format (messages, tool schemas)
-//	harness/config.go  - settings: model, server URL, prompt, limits
-//	harness/client.go  - HTTP call to the model server
-//	harness/tools.go   - Tool interface + example tools
-//	harness/harness.go - the agent loop that ties it all together
-//	main.go            - this file: wires everything up and runs a REPL
-//
-// To point this at a real model server: run Ollama (or similar) locally,
-// pull a tool-capable model (e.g. `ollama pull llama3.1`), then
-// `go run .` and start chatting.
 package main
 
 import (
+	"ai-harness/bdo/bdotools"
 	"ai-harness/harness"
 	"ai-harness/harness/config"
 	luatool "ai-harness/harness/lua-tool"
@@ -31,7 +16,7 @@ import (
 )
 
 func main() {
-	cfg := harness.TestConfig()
+	cfg := harness.BdoConfig()
 	conf := config.GetConfig()
 
 	// --- Edit these to point at a different model/server -------------
@@ -62,6 +47,7 @@ func main() {
 	registry.Register(tools.GetFileSizeTool{BaseDir: "."})
 	registry.Register(tools.EditFileTool{BaseDir: "."})
 	registry.Register(tools.WriteFileTool{BaseDir: "."})
+	bdotools.RegisterMarketTools(registry)
 
 	// --- Dynamic Custom Lua Tools Loader -------------------------------
 	defaultConfigDir := "agent/custom_tools"

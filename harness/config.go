@@ -65,13 +65,17 @@ func DefaultConfig() Config {
 	}
 }
 
-func TestConfig() Config {
+func BdoConfig() Config {
 	return Config{
-		BaseURL:           "http://192.168.1.235:8810/v1",
-		Model:             "qwen3-coder-next-gguf",
-		SystemPrompt:      "You are a helpful assistant running locally on the user's machine. Use tools when they help you answer accurately, and say so plainly when you don't know something.",
+		BaseURL: "http://192.168.1.235:8810/v1",
+		Model:   "Qwen3-4B-Thinking-2507-GGUF",
+		SystemPrompt: `You are a helpful assistant running locally on the user's machine to help them with their mmo rpg game bdo.
+							Use tools when they help you answer accurately, and say so plainly when you don't know something. 
+							When listing items from the market include enhancement and grade with the info the user requested.
+							Try differen variations of search queries when looking up things on the bdo market.
+							Try to include item details of the items if the user is searching for an item.`,
 		Temperature:       0.7,
-		MaxToolIterations: 100,
+		MaxToolIterations: 50, // might need
 		APIKey:            "sk-unsloth-94d524b13d50f995c58cbb5d08c090c3",
 	}
 }
