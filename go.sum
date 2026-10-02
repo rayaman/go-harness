@@ -1,3 +1,5 @@
+github.com/Wooderan/sec-downloader-go v0.0.0-20250318175442-51689041799a h1:fEuATIdRIHcbSjgUKT4llXLi466KdvNCQt91vyaPmNw=
+github.com/Wooderan/sec-downloader-go v0.0.0-20250318175442-51689041799a/go.mod h1:NufabTXiPHda8p4Wwcn1zWyrR6sNQx4y1mj8JHU+L8k=
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=

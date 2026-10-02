@@ -9,6 +9,7 @@ require (
 )
 
 require (
+	github.com/Wooderan/sec-downloader-go v0.0.0-20250318175442-51689041799a // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/go-viper/mapstructure/v2 v2.4.0 // indirect
