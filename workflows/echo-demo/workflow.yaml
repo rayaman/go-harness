@@ -1,0 +1,28 @@
+name: echo-demo
+description: Two chained steps showing vars, templating, and step outputs.
+
+vars:
+  topic: "what makes a good command-line agent harness"
+
+config:
+  # Partial overrides merged onto the --base-config preset (ollama by
+  # default). Everything not listed here keeps the preset's value.
+  temperature: 0.2
+  max_tool_iterations: 10
+
+tools:
+  builtin: [current_time]
+
+steps:
+  - name: outline
+    prompt: |
+      Write a 3-bullet outline about: {{topic}}.
+      Use the current_time tool once before answering.
+
+  - name: expand
+    # References the previous step's output via {{steps.<name>}}.
+    prompt_file: prompts/expand.txt
+    # Fresh conversation for this persona; drop the tools for this step.
+    system_prompt: "You are a concise technical writer."
+    tools: none
+    on_error: stop

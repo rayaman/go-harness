@@ -1,0 +1,9 @@
+name: models-report
+description: >
+  Programmatic workflow: main.lua lists every model the server knows,
+  probes each one's context window, and asks the model to compare them.
+  Demonstrates harness.list_models / context_length / ask from Lua.
+
+# No steps: with main.lua present, Lua drives everything.
+config:
+  temperature: 0.1

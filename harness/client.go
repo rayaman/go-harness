@@ -256,6 +256,84 @@ func (c *Client) doJSON(ctx context.Context, method, url string, reqBody any) ([
 	return respBody, nil
 }
 
+// ModelInfo describes one model as reported by the model server.
+type ModelInfo struct {
+	ID         string `json:"id"`
+	ModifiedAt string `json:"modified_at,omitempty"`
+	SizeBytes  int64  `json:"size,omitempty"`
+}
+
+// ListModels asks the model server which models it currently serves. It
+// tries the OpenAI-style GET /v1/models first (llama.cpp, Unsloth, vLLM,
+// and Ollama's own /v1 shim) and falls back to Ollama's native GET
+// /api/tags. Servers that implement neither return an error.
+func (c *Client) ListModels(ctx context.Context) ([]ModelInfo, error) {
+	if models, err := c.listModelsFromOpenAI(ctx); err == nil {
+		return models, nil
+	}
+	return c.listModelsFromOllamaTags(ctx)
+}
+
+func (c *Client) listModelsFromOpenAI(ctx context.Context) ([]ModelInfo, error) {
+	body, err := c.doJSON(ctx, http.MethodGet, c.baseURL+"/models", nil)
+	if err != nil {
+		return nil, err
+	}
+	// /v1/models entries differ by server; llama.cpp/Unsloth add "meta"
+	// with size/timestamps, while Ollama's shim only fills "id" and
+	// "created". Decode the union and keep what's present.
+	var parsed struct {
+		Data []struct {
+			ID      string `json:"id"`
+			Created int64  `json:"created"`
+			Meta    struct {
+				SizeBytes  int64  `json:"size_bytes"`
+				ModifiedAt string `json:"modified_at"`
+			} `json:"meta"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, fmt.Errorf("parse /v1/models response: %w", err)
+	}
+	out := make([]ModelInfo, 0, len(parsed.Data))
+	for _, m := range parsed.Data {
+		info := ModelInfo{ID: m.ID, ModifiedAt: m.Meta.ModifiedAt, SizeBytes: m.Meta.SizeBytes}
+		if info.ModifiedAt == "" && m.Created > 0 {
+			info.ModifiedAt = time.Unix(m.Created, 0).UTC().Format(time.RFC3339)
+		}
+		out = append(out, info)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("empty model list from /v1/models")
+	}
+	return out, nil
+}
+
+func (c *Client) listModelsFromOllamaTags(ctx context.Context) ([]ModelInfo, error) {
+	body, err := c.doJSON(ctx, http.MethodGet, c.rootURL()+"/api/tags", nil)
+	if err != nil {
+		return nil, err
+	}
+	var parsed struct {
+		Models []struct {
+			Name       string `json:"name"`
+			ModifiedAt string `json:"modified_at"`
+			Size       int64  `json:"size"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, fmt.Errorf("parse /api/tags response: %w", err)
+	}
+	out := make([]ModelInfo, 0, len(parsed.Models))
+	for _, m := range parsed.Models {
+		out = append(out, ModelInfo{ID: m.Name, ModifiedAt: m.ModifiedAt, SizeBytes: m.Size})
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("empty model list from /api/tags")
+	}
+	return out, nil
+}
+
 // ContextLength asks the model server for a model's maximum context
 // window, in tokens. There's no standard endpoint for this across
 // servers, so it tries each known convention in turn and returns the

@@ -6,8 +6,10 @@ import (
 	"ai-harness/harness/config"
 	luatool "ai-harness/harness/lua-tool"
 	"ai-harness/harness/tools"
+	"ai-harness/harness/workflow"
 	"bufio"
 	"context"
+	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -16,6 +18,24 @@ import (
 )
 
 func main() {
+	// --- Workflow mode -------------------------------------------------
+	// go run main.go --workflow path/to/workflow [extra args after --]
+	// Runs a declarative directory workflow (workflow.yaml / main.lua)
+	// against its own config overrides, then exits. The REPL below is
+	// skipped entirely. See plans/workflows.md and docs/workflows.md.
+	workflowDir := flag.String("workflow", "", "path to a workflow directory to run instead of the REPL")
+	basePreset := flag.String("base-config", "ollama", `base config for workflows: "ollama" or "openai"`)
+	flag.Parse()
+
+	if *workflowDir != "" {
+		if err := runWorkflow(*workflowDir, *basePreset, flag.Args()); err != nil {
+			fmt.Fprintf(os.Stderr, "workflow error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+	// ---------------------------------------------------------------------
+
 	cfg := harness.OllamaConfig()
 	conf := config.GetConfig()
 
@@ -174,6 +194,33 @@ func extractImageTokens(input string) (string, []string) {
 		imagePaths = append(imagePaths, path)
 	}
 	return strings.Join(kept, " "), imagePaths
+}
+
+// runWorkflow loads a workflow directory and executes it against the
+// selected base config preset. args become harness.args for main.lua
+// workflows (everything after the workflow directory on the command line).
+func runWorkflow(dir, basePreset string, args []string) error {
+	var base harness.Config
+	switch strings.ToLower(basePreset) {
+	case "ollama":
+		base = harness.OllamaConfig()
+	case "openai", "default":
+		base = harness.DefaultConfig()
+	default:
+		return fmt.Errorf("unknown --base-config %q (use \"ollama\" or \"openai\")", basePreset)
+	}
+
+	wf, err := workflow.Load(dir)
+	if err != nil {
+		return err
+	}
+	runner, err := workflow.New(wf, base, os.Stdout)
+	if err != nil {
+		return err
+	}
+	defer runner.Close()
+
+	return runner.Run(context.Background(), args)
 }
 
 var luaModTimes = make(map[string]time.Time)

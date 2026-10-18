@@ -26,6 +26,13 @@ var imageMimeTypes = map[string]string{
 	".webp": "image/webp",
 }
 
+// IsSupportedImage reports whether path has one of the supported image
+// extensions. Use it to fail fast with a clear message before handing the
+// path to LoadImage.
+func IsSupportedImage(path string) bool {
+	return imageMimeTypes[strings.ToLower(filepath.Ext(path))] != ""
+}
+
 // LoadImage reads an image file from disk and returns its raw base64
 // content (no data-URI prefix) and its detected MIME type. The caller
 // composes the provider-appropriate format: Ollama native wants the

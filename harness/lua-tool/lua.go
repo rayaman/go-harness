@@ -163,6 +163,20 @@ func (t *LuaTool) Execute(args json.RawMessage) (string, error) {
 // Lua <-> Go Type Conversion Helpers
 // -----------------------------------------------------------------------------
 
+// GoToLua converts a Go value (nil/bool/string/numbers/map[string]any/
+// []any) into the equivalent Lua value. Exported so other packages (e.g.
+// the workflow runner) can push Go data into a Lua state.
+func GoToLua(L *lua.LState, val any) lua.LValue {
+	return goToLua(L, val)
+}
+
+// LuaToGo converts a Lua value into plain Go types (bool/float64/string/
+// map[string]any/[]any; anything else becomes nil). Exported for the same
+// reason as GoToLua.
+func LuaToGo(val lua.LValue) any {
+	return luaToGo(val)
+}
+
 func goToLua(L *lua.LState, val any) lua.LValue {
 	switch v := val.(type) {
 	case nil:

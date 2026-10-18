@@ -1,0 +1,3 @@
+Expand the following outline into one tight paragraph:
+
+{{steps.outline}}
