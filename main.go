@@ -16,7 +16,7 @@ import (
 )
 
 func main() {
-	cfg := harness.BdoConfig()
+	cfg := harness.OllamaConfig()
 	conf := config.GetConfig()
 
 	// --- Edit these to point at a different model/server -------------
@@ -112,7 +112,18 @@ func main() {
 			reloadLuaTools(customToolsDir, registry)
 		}
 
-		reply, err := h.Ask(ctx, input)
+		// Tokens that start with '@' (e.g. @C:\pics\cat.png or @./img/shot.jpg)
+		// are pulled out of the line as image file paths and sent through
+		// AskWithImages, which loads them itself and reports per-file errors
+		// to stderr while continuing the prompt.
+		cleanedInput, imagePaths := extractImageTokens(input)
+
+		var reply string
+		if len(imagePaths) > 0 {
+			reply, err = h.AskWithImages(ctx, cleanedInput, imagePaths)
+		} else {
+			reply, err = h.Ask(ctx, cleanedInput)
+		}
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			continue
@@ -136,6 +147,33 @@ func main() {
 				h.LastUsage.PromptTokens, h.LastUsage.CompletionTokens, h.LastUsage.TotalTokens)
 		}
 	}
+}
+
+// extractImageTokens splits a REPL input line on whitespace and pulls out
+// every token that begins with '@' followed by at least one character. The
+// '@' (and any single pair of matching surrounding quotes, e.g.
+// `@"C:\pics\cat.png"`) is stripped and the remainder is collected as an
+// image file path; the rest of the line is rejoined as the model prompt.
+// A bare '@' is kept as literal text. The paths are NOT read or encoded
+// here - Harness.AskWithImages does that and warns per-file on failure.
+func extractImageTokens(input string) (string, []string) {
+	var kept, imagePaths []string
+	for _, tok := range strings.Fields(input) {
+		if tok == "@" || tok[0] != '@' {
+			kept = append(kept, tok)
+			continue
+		}
+		path := tok[1:]
+		if len(path) >= 2 && (path[0] == '"' || path[0] == '\'') && path[len(path)-1] == path[0] {
+			path = path[1 : len(path)-1]
+		}
+		if path == "" {
+			kept = append(kept, tok)
+			continue
+		}
+		imagePaths = append(imagePaths, path)
+	}
+	return strings.Join(kept, " "), imagePaths
 }
 
 var luaModTimes = make(map[string]time.Time)

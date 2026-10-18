@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+
+	"ai-harness/harness/utils"
 )
 
 // Harness ties together a Client (talks to the model server), a Registry
@@ -49,18 +52,105 @@ func New(cfg Config, client *Client, registry *Registry) *Harness {
 // This is the main entry point to call for each turn of conversation -
 // from a CLI REPL, a web handler, a scheduled job, etc.
 func (h *Harness) Ask(ctx context.Context, userInput string) (string, error) {
-	h.History = append(h.History, Message{Role: "user", Content: userInput})
+	return h.askLoop(ctx, userInput, nil)
+}
+
+// AskWithImages is Ask() with image files attached to the user message
+// (paths to png/jpg/jpeg/gif/webp on disk). Use it instead of Ask when the
+// turn needs vision input; it runs the exact same agent loop, including any
+// tool calls the model decides to make.
+func (h *Harness) AskWithImages(ctx context.Context, input string, imagePaths []string) (string, error) {
+	return h.askLoop(ctx, input, imagePaths)
+}
+
+// buildUserMessage assembles the user Message for this turn, attaching any
+// images in the shape the configured provider expects:
+//
+//   - Provider "ollama": Content stays a plain string and the raw base64
+//     blobs go on Message.Images, since Ollama's native /api/chat takes
+//     images: [base64...] with no data-URI prefix.
+//   - Anything else: the OpenAI-compat multimodal shape - Content becomes a
+//     []ContentPart holding one text part plus one image_url part per
+//     image, where the URL is a "data:<mime>;base64,<b64>" URI.
+//
+// An image file that fails to load is reported on stderr and skipped: the
+// prompt still goes out with whatever images did load, rather than
+// discarding the whole turn over one bad path.
+func (h *Harness) buildUserMessage(input string, imagePaths []string) Message {
+	if h.Config.Provider == "ollama" {
+		// Declared as a nil slice on purpose: with no images it stays nil
+		// (never an empty slice), so json.Marshal omits "images" entirely
+		// from the request body.
+		var images []string
+		for _, path := range imagePaths {
+			b64, _, err := utils.LoadImage(path)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "warning: skipping image: %v\n", err)
+				continue
+			}
+			images = append(images, b64)
+		}
+		return Message{Role: "user", Content: input, Images: images}
+	}
+
+	textContent := input
+	parts := []ContentPart{{Type: "text", Text: &textContent}}
+	for _, path := range imagePaths {
+		b64, mime, err := utils.LoadImage(path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: skipping image: %v\n", err)
+			continue
+		}
+		// Text stays nil on image parts and ImageURL stays nil on the text
+		// part, so each part marshals with only the key that applies to it.
+		parts = append(parts, ContentPart{
+			Type:     "image_url",
+			ImageURL: &ImageURL{URL: "data:" + mime + ";base64," + b64},
+		})
+	}
+
+	// No images were requested, or none of them loaded: a bare string
+	// Content is what every OpenAI-compat server accepts, so fall back to
+	// that instead of sending a lone text part.
+	if len(parts) == 1 {
+		return Message{Role: "user", Content: input}
+	}
+	return Message{Role: "user", Content: parts}
+}
+
+// askLoop is the agent loop shared by Ask and AskWithImages: append the
+// user message (with images, if any), then keep trading tool calls and
+// results until the model returns a final text answer.
+func (h *Harness) askLoop(ctx context.Context, userInput string, imagePaths []string) (string, error) {
+	h.History = append(h.History, h.buildUserMessage(userInput, imagePaths))
 
 	for i := 0; i < h.Config.MaxToolIterations; i++ {
-		resp, err := h.Client.ChatCompletion(ctx, ChatRequest{
+		chatReq := ChatRequest{
 			Model:       h.Config.Model,
 			Messages:    h.History,
 			Tools:       h.Registry.Schemas(),
 			Temperature: h.Config.Temperature,
 			Stream:      false,
-		})
-		if err != nil {
-			return "", fmt.Errorf("chat completion: %w", err)
+		}
+
+		// Provider dispatch: "ollama" goes to the native /api/chat endpoint
+		// (which accepts images and lets us set num_ctx, so the context
+		// window isn't left to the server's default); every other provider
+		// uses the OpenAI-compatible chat-completions endpoint. Both return
+		// the same ChatResponse shape, so everything below is shared.
+		var resp *ChatResponse
+		if h.Config.Provider == "ollama" {
+			ollamaResp, err := h.Client.OllamaChat(ctx, chatReq, h.Config.MaxContextTokens)
+			if err != nil {
+				return "", fmt.Errorf("ollama chat: %w", err)
+			}
+			resp = ollamaResp
+		} else {
+			openaiResp, err := h.Client.ChatCompletion(ctx, chatReq)
+			if err != nil {
+				return "", fmt.Errorf("chat completion: %w", err)
+			}
+			resp = openaiResp
 		}
 		if len(resp.Choices) == 0 {
 			return "", fmt.Errorf("model server returned no choices")
@@ -72,7 +162,7 @@ func (h *Harness) Ask(ctx context.Context, userInput string) (string, error) {
 
 		// No tool calls -> the model is giving its final answer.
 		if len(assistantMsg.ToolCalls) == 0 {
-			return assistantMsg.Content, nil
+			return ExtractText(assistantMsg.Content), nil
 		}
 
 		// Otherwise, run each requested tool and feed the results back

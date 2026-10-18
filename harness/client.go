@@ -80,6 +80,133 @@ func (c *Client) ChatCompletion(ctx context.Context, req ChatRequest) (*ChatResp
 	return &chatResp, nil
 }
 
+// ollamaArgumentsToObject parses a FunctionCall.Arguments JSON string back
+// into the object form Ollama's native API expects. Malformed arguments
+// degrade to {} so the request still goes out.
+func ollamaArgumentsToObject(arguments string) map[string]any {
+	var args map[string]any
+	if arguments != "" {
+		if err := json.Unmarshal([]byte(arguments), &args); err != nil {
+			return map[string]any{}
+		}
+	}
+	return args
+}
+
+// ollamaMessages converts wire Messages into Ollama's native /api/chat
+// message shape {role, content, images?, tool_calls?}. Images flow through
+// as base64 without a data-URI prefix, which is what native Ollama wants.
+// Tool-call arguments are re-parsed from the JSON string we carry on the
+// wire back into the object form native expects, so multi-turn tool loops
+// round-trip correctly.
+func ollamaMessages(messages []Message) []map[string]any {
+	out := make([]map[string]any, 0, len(messages))
+	for _, msg := range messages {
+		m := map[string]any{"role": msg.Role, "content": ExtractText(msg.Content)}
+		if len(msg.Images) > 0 {
+			m["images"] = msg.Images
+		}
+		if len(msg.ToolCalls) > 0 {
+			calls := make([]map[string]any, 0, len(msg.ToolCalls))
+			for _, call := range msg.ToolCalls {
+				calls = append(calls, map[string]any{
+					"function": map[string]any{
+						"name":      call.Function.Name,
+						"arguments": ollamaArgumentsToObject(call.Function.Arguments),
+					},
+				})
+			}
+			m["tool_calls"] = calls
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// OllamaChat sends the conversation to Ollama's native /api/chat endpoint
+// (no "/v1" prefix, unlike the OpenAI-compat path) and maps the native
+// response back into the wire ChatResponse shape so the agent loop stays
+// unchanged. Pass numCtx <= 0 to keep the server's default context window;
+// harness.go passes Config.MaxContextTokens.
+func (c *Client) OllamaChat(ctx context.Context, req ChatRequest, numCtx int) (*ChatResponse, error) {
+	body := map[string]any{
+		"model":    req.Model,
+		"messages": ollamaMessages(req.Messages),
+		"stream":   false,
+	}
+	if len(req.Tools) > 0 {
+		body["tools"] = req.Tools
+	}
+	options := map[string]any{}
+	if numCtx > 0 {
+		options["num_ctx"] = numCtx
+	}
+	if req.Temperature != 0 {
+		options["temperature"] = req.Temperature
+	}
+	if len(options) > 0 {
+		body["options"] = options
+	}
+
+	respBody, err := c.doJSON(ctx, http.MethodPost, c.rootURL()+"/api/chat", body)
+	if err != nil {
+		return nil, err
+	}
+
+	var parsed struct {
+		Message struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+			// Ollama's field name is plural ("tool_calls"), unlike the
+			// OpenAI-compat path's singular "tool_call".
+			ToolCalls []struct {
+				Function struct {
+					Name      string `json:"name"`
+					Arguments any    `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(respBody, &parsed); err != nil {
+		return nil, fmt.Errorf("parse native response: %w (body: %s)", err, string(respBody))
+	}
+
+	var toolCalls []ToolCall
+	for i, call := range parsed.Message.ToolCalls {
+		arguments := "{}"
+		if call.Function.Arguments != nil {
+			b, err := json.Marshal(call.Function.Arguments)
+			if err != nil {
+				return nil, fmt.Errorf("serialize tool-call arguments: %w", err)
+			}
+			arguments = string(b)
+		}
+		// Native Ollama links tool calls to results by order, not by ID, so
+		// synthesized IDs here are only placeholders for the wire type.
+		toolCalls = append(toolCalls, ToolCall{
+			ID:       fmt.Sprintf("ollama_call_%d", i),
+			Type:     "function",
+			Function: FunctionCall{Name: call.Function.Name, Arguments: arguments},
+		})
+	}
+
+	return &ChatResponse{
+		Choices: []struct {
+			Message      Message `json:"message"`
+			FinishReason string  `json:"finish_reason"`
+		}{
+			{
+				Message: Message{
+					Role:      parsed.Message.Role,
+					Content:   parsed.Message.Content,
+					ToolCalls: toolCalls,
+				},
+				FinishReason: "stop",
+			},
+		},
+	}, nil
+}
+
 // rootURL strips a trailing "/v1" so we can also reach native endpoints
 // (like Ollama's /api/show or llama.cpp's /props) at the same host as the
 // OpenAI-compatible chat endpoint. If your BaseURL doesn't end in "/v1"
