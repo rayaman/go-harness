@@ -1,6 +1,7 @@
 package workflow
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -41,6 +42,38 @@ type Runner struct {
 	stepOutputs map[string]string
 
 	sess *session
+
+	// thinking buffers streamed thinking deltas (when cfg.StreamThinking)
+	// into "[thinking] "-prefixed lines on out. Nil when streaming is off.
+	thinking *thinkingPrinter
+}
+
+// thinkingPrinter turns raw thinking deltas into "[thinking] "-prefixed
+// lines on a writer: deltas arrive as arbitrary token-sized fragments, so
+// partial lines are buffered until a newline arrives or flush() closes out
+// the thinking phase.
+type thinkingPrinter struct {
+	out io.Writer
+	buf []byte
+}
+
+func (t *thinkingPrinter) writeThinking(text string) {
+	t.buf = append(t.buf, text...)
+	for {
+		i := bytes.IndexByte(t.buf, '\n')
+		if i < 0 {
+			break
+		}
+		fmt.Fprintf(t.out, "[thinking] %s\n", t.buf[:i])
+		t.buf = t.buf[i+1:]
+	}
+}
+
+func (t *thinkingPrinter) flush() {
+	if len(t.buf) > 0 {
+		fmt.Fprintf(t.out, "[thinking] %s\n", t.buf)
+		t.buf = nil
+	}
 }
 
 // session is the mutable execution state shared by the steps loop and the
@@ -59,14 +92,20 @@ func New(wf *Workflow, base harness.Config, out io.Writer) (*Runner, error) {
 	if out == nil {
 		out = os.Stdout
 	}
+	cfg, err := wf.MergeConfig(base)
+	if err != nil {
+		return nil, err
+	}
 	r := &Runner{
 		wf:          wf,
-		cfg:         wf.MergeConfig(base),
+		cfg:         cfg,
 		out:         out,
 		tools:       map[string]harness.Tool{},
 		stepOutputs: map[string]string{},
 	}
 	r.client = harness.NewClient(r.cfg.BaseURL, r.cfg.APIKey)
+	// Zero RequestTimeout is a no-op here, leaving NewClient's 5m default.
+	r.client.SetRequestTimeout(r.cfg.RequestTimeout)
 
 	// Same auto-probe the REPL does in main.go: trust the server over
 	// the config when it reports a context window.
@@ -90,6 +129,30 @@ func (r *Runner) Close() {
 	for _, t := range r.luaTools {
 		t.Close()
 	}
+}
+
+// newHarness builds a Harness for the runner's config and, when
+// StreamThinking is enabled, wires OnDelta so thinking deltas print live
+// to r.out as "[thinking] ..." lines. Content deltas are deliberately
+// ignored here: workflow step output is captured and printed once at the
+// end of the step (see runStep), so streaming content live would
+// double-print it.
+func (r *Runner) newHarness(cfg harness.Config, reg *harness.Registry) *harness.Harness {
+	h := harness.New(cfg, r.client, reg)
+	if r.cfg.StreamThinking {
+		tp := &thinkingPrinter{out: r.out}
+		r.thinking = tp
+		h.OnDelta = func(kind, text string) {
+			switch kind {
+			case "thinking":
+				tp.writeThinking(text)
+			case "content":
+				// Thinking phase is over: complete any partial line.
+				tp.flush()
+			}
+		}
+	}
+	return h
 }
 
 // -----------------------------------------------------------------------------
@@ -293,6 +356,11 @@ func (r *Runner) runStep(ctx context.Context, st *Step) (string, error) {
 		result, err = h.Ask(ctx, prompt)
 	}
 	h.Config.Model, h.Config.Temperature = oldModel, oldTemp
+	// Close out any unterminated thinking line before the result print so
+	// the two never interleave on the output.
+	if r.thinking != nil {
+		r.thinking.flush()
+	}
 	if err != nil {
 		return "", err
 	}
@@ -342,11 +410,11 @@ func (r *Runner) harnessForStep(st *Step) (*harness.Harness, error) {
 	if st.SystemPrompt != "" {
 		cfg := r.cfg
 		cfg.SystemPrompt = st.SystemPrompt
-		r.sess.h = harness.New(cfg, r.client, reg)
+		r.sess.h = r.newHarness(cfg, reg)
 		return r.sess.h, nil
 	}
 	if r.sess.h == nil {
-		r.sess.h = harness.New(r.cfg, r.client, reg)
+		r.sess.h = r.newHarness(r.cfg, reg)
 	} else {
 		r.sess.h.Registry = reg
 	}

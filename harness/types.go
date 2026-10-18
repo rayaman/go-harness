@@ -16,6 +16,12 @@ type Message struct {
 	// json.Unmarshal accepts whatever the server sends back.
 	Content any `json:"content"`
 
+	// ReasoningContent carries a model's thinking/reasoning trace when the
+	// server sends one: "reasoning_content" on the OpenAI-compat path
+	// (llama.cpp/vLLM thinking servers) and "thinking" on Ollama's native
+	// path. omitempty keeps it out of request bodies for ordinary messages.
+	ReasoningContent string `json:"reasoning_content,omitempty"`
+
 	// Images carries base64-encoded images (no data-URI prefix) for Ollama's
 	// native /api/chat, which takes `images: [base64...]`. Leave it nil for
 	// non-image messages so the key is omitted from the JSON body.
@@ -70,6 +76,13 @@ type ChatRequest struct {
 	Tools       []ToolSchema `json:"tools,omitempty"`
 	Temperature float64      `json:"temperature,omitempty"`
 	Stream      bool         `json:"stream"`
+}
+
+// ChatDelta is one streamed chunk of a chat completion: reply text,
+// reasoning/thinking text, or either one (whichever field is non-empty).
+type ChatDelta struct {
+	Content          string
+	ReasoningContent string
 }
 
 // ToolSchema is how a tool is described *to the model* so it knows the

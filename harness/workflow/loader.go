@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -66,6 +67,18 @@ type ConfigOverrides struct {
 	Temperature       *float64 `yaml:"temperature"`
 	MaxToolIterations *int     `yaml:"max_tool_iterations"`
 	MaxContextTokens  *int     `yaml:"max_context_tokens"`
+	// RequestTimeout is a Go duration string ("10m", "300s") capping each
+	// model-server HTTP request. Parsed in MergeConfig so bad values fail
+	// with a clear message; unset keeps the client default (5m).
+	RequestTimeout *string `yaml:"request_timeout"`
+	// MaxImageDimension is the longest-side pixel cap for images attached
+	// to model requests (e.g. 2048). Validated > 0 in MergeConfig; unset
+	// means no scaling at all (image bytes go out exactly as on disk).
+	MaxImageDimension *int `yaml:"image_max_dimension"`
+	// StreamThinking enables live streaming of the model's thinking/
+	// reasoning output to the workflow's output writer. Unset keeps the
+	// base config's value (normally false).
+	StreamThinking *bool `yaml:"stream_thinking"`
 }
 
 // ToolsSpec selects the tools a workflow registers into its Registry.
@@ -233,8 +246,11 @@ func (wf *Workflow) LuaMainPath() string {
 
 // MergeConfig overlays the workflow's config block onto base and returns the
 // resulting Config. base is typically harness.OllamaConfig() or
-// harness.DefaultConfig().
-func (wf *Workflow) MergeConfig(base harness.Config) harness.Config {
+// harness.DefaultConfig(). An invalid request_timeout or
+// image_max_dimension is reported as an error; an unset/zero RequestTimeout
+// means "keep the client default (5m)" and an unset image_max_dimension
+// means "send images unmodified".
+func (wf *Workflow) MergeConfig(base harness.Config) (harness.Config, error) {
 	out := base
 	c := wf.Config
 	if c.Provider != nil {
@@ -261,7 +277,23 @@ func (wf *Workflow) MergeConfig(base harness.Config) harness.Config {
 	if c.MaxContextTokens != nil {
 		out.MaxContextTokens = *c.MaxContextTokens
 	}
-	return out
+	if c.RequestTimeout != nil {
+		d, err := time.ParseDuration(*c.RequestTimeout)
+		if err != nil {
+			return out, fmt.Errorf("invalid request_timeout %q: %w (use a Go duration like \"10m\" or \"300s\")", *c.RequestTimeout, err)
+		}
+		out.RequestTimeout = d
+	}
+	if c.MaxImageDimension != nil {
+		if *c.MaxImageDimension <= 0 {
+			return out, fmt.Errorf(`invalid image_max_dimension "%d": must be > 0 (longest-side pixels; omit the key to disable scaling)`, *c.MaxImageDimension)
+		}
+		out.MaxImageDimension = *c.MaxImageDimension
+	}
+	if c.StreamThinking != nil {
+		out.StreamThinking = *c.StreamThinking
+	}
+	return out, nil
 }
 
 // ResolvePath maps a path declared in workflow.yaml (prompt file, media

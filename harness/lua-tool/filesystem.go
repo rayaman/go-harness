@@ -25,9 +25,14 @@ func RegisterFilesystemModule(L *lua.LState, cfg FilesystemConfig) {
 		"edit_file":         makeEditFileFunc(cfg),
 	}
 
-	// Register module so scripts can use `local fs = require("filesystem")`
+	// Register module so scripts can use `local fs = require("filesystem")`.
+	// The preload loader must PUSH the module table: SetFuncs only fills it,
+	// and the loader's stack top is otherwise the module-name string, which
+	// require() would then hand back as the "module".
 	L.PreloadModule("filesystem", func(L *lua.LState) int {
-		L.SetFuncs(L.NewTable(), exports)
+		tbl := L.NewTable()
+		L.SetFuncs(tbl, exports)
+		L.Push(tbl)
 		return 1
 	})
 }

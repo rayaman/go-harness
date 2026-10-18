@@ -25,10 +25,11 @@ func main() {
 	// skipped entirely. See plans/workflows.md and docs/workflows.md.
 	workflowDir := flag.String("workflow", "", "path to a workflow directory to run instead of the REPL")
 	basePreset := flag.String("base-config", "ollama", `base config for workflows: "ollama" or "openai"`)
+	streamThinking := flag.Bool("stream-thinking", false, "stream model thinking/reasoning output live")
 	flag.Parse()
 
 	if *workflowDir != "" {
-		if err := runWorkflow(*workflowDir, *basePreset, flag.Args()); err != nil {
+		if err := runWorkflow(*workflowDir, *basePreset, *streamThinking, flag.Args()); err != nil {
 			fmt.Fprintf(os.Stderr, "workflow error: %v\n", err)
 			os.Exit(1)
 		}
@@ -103,7 +104,39 @@ func main() {
 		}
 	}
 
+	cfg.StreamThinking = *streamThinking
+
 	h := harness.New(cfg, client, registry)
+
+	// With --stream-thinking, print deltas live: thinking traces on
+	// their own "[thinking] "-prefixed lines, content as it arrives.
+	// streamedContent tracks whether the reply text already went out, so
+	// the final print below doesn't duplicate it.
+	streamedContent := false
+	if cfg.StreamThinking {
+		thinkBuf := ""
+		h.OnDelta = func(kind, text string) {
+			switch kind {
+			case "thinking":
+				thinkBuf += text
+				for {
+					i := strings.IndexByte(thinkBuf, '\n')
+					if i < 0 {
+						break
+					}
+					fmt.Printf("[thinking] %s\n", thinkBuf[:i])
+					thinkBuf = thinkBuf[i+1:]
+				}
+			case "content":
+				if thinkBuf != "" {
+					fmt.Printf("[thinking] %s\n", thinkBuf)
+					thinkBuf = ""
+				}
+				streamedContent = true
+				fmt.Print(text)
+			}
+		}
+	}
 
 	fmt.Printf("ai-harness ready - model %q at %s. Type 'exit' to quit.\n", cfg.Model, cfg.BaseURL)
 
@@ -148,7 +181,12 @@ func main() {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			continue
 		}
-		fmt.Println(reply)
+		if streamedContent {
+			// The reply already streamed live; just close the line.
+			fmt.Println()
+		} else {
+			fmt.Println(reply)
+		}
 		switch {
 		case h.LastUsage.TotalTokens == 0:
 			// This is the "nothing printed" case - the server's response
@@ -199,7 +237,9 @@ func extractImageTokens(input string) (string, []string) {
 // runWorkflow loads a workflow directory and executes it against the
 // selected base config preset. args become harness.args for main.lua
 // workflows (everything after the workflow directory on the command line).
-func runWorkflow(dir, basePreset string, args []string) error {
+// streamThinking is the base default for Config.StreamThinking; a
+// workflow's config.stream_thinking still overrides it in MergeConfig.
+func runWorkflow(dir, basePreset string, streamThinking bool, args []string) error {
 	var base harness.Config
 	switch strings.ToLower(basePreset) {
 	case "ollama":
@@ -209,6 +249,7 @@ func runWorkflow(dir, basePreset string, args []string) error {
 	default:
 		return fmt.Errorf("unknown --base-config %q (use \"ollama\" or \"openai\")", basePreset)
 	}
+	base.StreamThinking = streamThinking
 
 	wf, err := workflow.Load(dir)
 	if err != nil {

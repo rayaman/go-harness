@@ -32,6 +32,15 @@ type Harness struct {
 	// completion call. Not every server populates this (it's
 	// best-effort), so check for a zero value before relying on it.
 	LastUsage Usage
+
+	// OnDelta is called with streamed model output when
+	// Config.StreamThinking is enabled: kind is "thinking" for the
+	// model's reasoning trace or "content" for the reply text, with the
+	// delta's raw text. Set it after New (like Registry above - it's
+	// plain mutable state, not constructor config). Never called on the
+	// non-streaming path, and Ask's return value / History are the same
+	// either way.
+	OnDelta func(kind, text string)
 }
 
 // New creates a Harness and seeds the conversation with the system prompt.
@@ -83,7 +92,7 @@ func (h *Harness) buildUserMessage(input string, imagePaths []string) Message {
 		// from the request body.
 		var images []string
 		for _, path := range imagePaths {
-			b64, _, err := utils.LoadImage(path)
+			b64, _, err := utils.LoadImageScaled(path, h.Config.MaxImageDimension)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "warning: skipping image: %v\n", err)
 				continue
@@ -96,7 +105,7 @@ func (h *Harness) buildUserMessage(input string, imagePaths []string) Message {
 	textContent := input
 	parts := []ContentPart{{Type: "text", Text: &textContent}}
 	for _, path := range imagePaths {
-		b64, mime, err := utils.LoadImage(path)
+		b64, mime, err := utils.LoadImageScaled(path, h.Config.MaxImageDimension)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "warning: skipping image: %v\n", err)
 			continue
@@ -138,8 +147,38 @@ func (h *Harness) askLoop(ctx context.Context, userInput string, imagePaths []st
 		// window isn't left to the server's default); every other provider
 		// uses the OpenAI-compatible chat-completions endpoint. Both return
 		// the same ChatResponse shape, so everything below is shared.
+		//
+		// With Config.StreamThinking the same dispatch takes the streaming
+		// variants, forwarding deltas to OnDelta. The accumulated
+		// ChatResponse they return is equivalent to the buffered one, so
+		// the rest of the loop (History, usage, tool calls) is untouched.
 		var resp *ChatResponse
-		if h.Config.Provider == "ollama" {
+		if h.Config.StreamThinking {
+			onDelta := func(d ChatDelta) {
+				if h.OnDelta == nil {
+					return
+				}
+				if d.ReasoningContent != "" {
+					h.OnDelta("thinking", d.ReasoningContent)
+				}
+				if d.Content != "" {
+					h.OnDelta("content", d.Content)
+				}
+			}
+			if h.Config.Provider == "ollama" {
+				streamResp, err := h.Client.OllamaChatStream(ctx, chatReq, h.Config.MaxContextTokens, onDelta)
+				if err != nil {
+					return "", fmt.Errorf("ollama chat stream: %w", err)
+				}
+				resp = streamResp
+			} else {
+				streamResp, err := h.Client.ChatCompletionStream(ctx, chatReq, onDelta)
+				if err != nil {
+					return "", fmt.Errorf("chat completion stream: %w", err)
+				}
+				resp = streamResp
+			}
+		} else if h.Config.Provider == "ollama" {
 			ollamaResp, err := h.Client.OllamaChat(ctx, chatReq, h.Config.MaxContextTokens)
 			if err != nil {
 				return "", fmt.Errorf("ollama chat: %w", err)

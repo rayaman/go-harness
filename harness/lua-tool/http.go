@@ -46,9 +46,13 @@ func RegisterHTTPModule(L *lua.LState, cfg HTTPConfig) {
 		"request": makeHTTPRequestFunc(client, cfg),
 	}
 
-	// Register module so scripts can use `local http = require("http")`
+	// Register module so scripts can use `local http = require("http")`.
+	// Push the module table explicitly: SetFuncs only populates it, and
+	// without a push require() returns the module-name string instead.
 	L.PreloadModule("http", func(L *lua.LState) int {
-		L.SetFuncs(L.NewTable(), exports)
+		tbl := L.NewTable()
+		L.SetFuncs(tbl, exports)
+		L.Push(tbl)
 		return 1
 	})
 }

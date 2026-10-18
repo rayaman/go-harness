@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
+	"time"
 
 	lua "github.com/yuin/gopher-lua"
 
@@ -33,10 +36,19 @@ import (
 //	harness.vars                               -> workflow vars table
 //	harness.args                               -> extra CLI args table
 //	harness.log(...)                           -> stdout logging
+//	harness.external.abspath(p)                -> absolute path, err
+//	harness.external.exists(p)                 -> bool, err
+//	harness.external.is_dir(p)                 -> bool, err
+//	harness.external.mkdir(p)                  -> created dir, err (MkdirAll)
+//	harness.external.list_images(dir)          -> sorted absolute image paths, err
+//	harness.external.read_file(p)              -> text, err
+//	harness.external.write_file(p, content)    -> message, err (parents auto-created)
+//	harness.external.sleep(seconds)            -> nil, err (backoff helper for retry loops)
 //	json.encode(t) / json.decode(s)            -> table <-> JSON string
 //
 // Plus the sandboxed require("http") and require("filesystem") modules from
-// the existing luatool package.
+// the existing luatool package. harness.external is the deliberate
+// sandbox-bypass sibling of "filesystem" - see newExternalTable.
 
 func (r *Runner) runLuaMain(ctx context.Context) error {
 	L := lua.NewState()
@@ -70,6 +82,7 @@ func (r *Runner) registerHarnessModule(L *lua.LState, ctx context.Context) {
 			"step_results":      r.luaStepResults,
 			"log":               r.luaLog,
 		})
+		tbl.RawSetString("external", newExternalTable(L))
 		tbl.RawSetString("vars", luatool.GoToLua(L, mapAny(r.wf.Vars)))
 		argsLua := make([]any, len(r.sess.args))
 		for i, a := range r.sess.args {
@@ -325,6 +338,191 @@ func (r *Runner) luaLog(L *lua.LState) int {
 }
 
 // -----------------------------------------------------------------------------
+// harness.external - sandbox bypass for human-supplied paths
+// -----------------------------------------------------------------------------
+
+// newExternalTable builds harness.external: path/file helpers that
+// deliberately skip the workflow-dir sandbox. They exist so a main.lua can
+// work with directories the *human* chose (an input image folder, an
+// output folder) instead of paths the model picked. The safety model is
+// provenance, not path validation: this table is attached only inside the
+// main.lua VM (runLuaMain), never in the model's tool registry, so
+// model-chosen tool arguments can never reach these functions. main.lua
+// scripts are trusted code run by the user; they must treat the paths the
+// user typed as legitimate and keep model-derived text out of them.
+func newExternalTable(L *lua.LState) *lua.LTable {
+	tbl := L.NewTable()
+	L.SetFuncs(tbl, map[string]lua.LGFunction{
+		"abspath":     luaExtAbsPath,
+		"exists":      luaExtExists,
+		"is_dir":      luaExtIsDir,
+		"mkdir":       luaExtMkdir,
+		"list_images": luaExtListImages,
+		"read_file":   luaExtReadFile,
+		"write_file":  luaExtWriteFile,
+		"sleep":       luaExtSleep,
+	})
+	return tbl
+}
+
+// extAbs resolves a user-supplied path to an absolute one, relative to the
+// process working directory. filepath.Abs already cleans the result.
+func extAbs(p string) (string, error) {
+	if p == "" {
+		return "", fmt.Errorf("empty path")
+	}
+	return filepath.Abs(p)
+}
+
+func luaExtAbsPath(L *lua.LState) int {
+	full, err := extAbs(L.CheckString(1))
+	if err != nil {
+		return pushLuaError(L, err)
+	}
+	L.Push(lua.LString(full))
+	L.Push(lua.LNil)
+	return 2
+}
+
+// luaExtExists reports false (with a nil error) for missing paths; only
+// stat errors other than "not found" become errors.
+func luaExtExists(L *lua.LState) int {
+	full, err := extAbs(L.CheckString(1))
+	if err != nil {
+		return pushLuaError(L, err)
+	}
+	if _, err := os.Stat(full); err != nil {
+		if os.IsNotExist(err) {
+			L.Push(lua.LFalse)
+			L.Push(lua.LNil)
+			return 2
+		}
+		return pushLuaError(L, err)
+	}
+	L.Push(lua.LTrue)
+	L.Push(lua.LNil)
+	return 2
+}
+
+func luaExtIsDir(L *lua.LState) int {
+	full, err := extAbs(L.CheckString(1))
+	if err != nil {
+		return pushLuaError(L, err)
+	}
+	info, err := os.Stat(full)
+	if err != nil {
+		if os.IsNotExist(err) {
+			L.Push(lua.LFalse)
+			L.Push(lua.LNil)
+			return 2
+		}
+		return pushLuaError(L, err)
+	}
+	L.Push(lua.LBool(info.IsDir()))
+	L.Push(lua.LNil)
+	return 2
+}
+
+func luaExtMkdir(L *lua.LState) int {
+	full, err := extAbs(L.CheckString(1))
+	if err != nil {
+		return pushLuaError(L, err)
+	}
+	if err := os.MkdirAll(full, 0o755); err != nil {
+		return pushLuaError(L, err)
+	}
+	L.Push(lua.LString(full))
+	L.Push(lua.LNil)
+	return 2
+}
+
+// luaExtListImages walks a directory recursively and returns every file
+// with a supported image extension (utils.IsSupportedImage), sorted by
+// absolute path so page order follows filename order.
+func luaExtListImages(L *lua.LState) int {
+	full, err := extAbs(L.CheckString(1))
+	if err != nil {
+		return pushLuaError(L, err)
+	}
+	info, err := os.Stat(full)
+	if err != nil {
+		return pushLuaError(L, err)
+	}
+	if !info.IsDir() {
+		return pushLuaError(L, fmt.Errorf("%s is not a directory", full))
+	}
+	var found []string
+	walkErr := filepath.Walk(full, func(path string, fi os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !fi.IsDir() && utils.IsSupportedImage(path) {
+			found = append(found, path)
+		}
+		return nil
+	})
+	if walkErr != nil {
+		return pushLuaError(L, walkErr)
+	}
+	sort.Strings(found)
+	items := make([]any, len(found))
+	for i, p := range found {
+		items[i] = p
+	}
+	L.Push(luatool.GoToLua(L, items))
+	L.Push(lua.LNil)
+	return 2
+}
+
+func luaExtReadFile(L *lua.LState) int {
+	full, err := extAbs(L.CheckString(1))
+	if err != nil {
+		return pushLuaError(L, err)
+	}
+	data, err := os.ReadFile(full)
+	if err != nil {
+		return pushLuaError(L, err)
+	}
+	L.Push(lua.LString(data))
+	L.Push(lua.LNil)
+	return 2
+}
+
+// luaExtWriteFile writes content to any path outside the sandbox, creating
+// parent directories. This intentionally bypasses the workflow-dir
+// sandbox; see newExternalTable for why that is considered safe.
+func luaExtWriteFile(L *lua.LState) int {
+	full, err := extAbs(L.CheckString(1))
+	if err != nil {
+		return pushLuaError(L, err)
+	}
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		return pushLuaError(L, err)
+	}
+	content := L.CheckString(2)
+	if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+		return pushLuaError(L, err)
+	}
+	L.Push(lua.LString(fmt.Sprintf("wrote %d bytes to %s", len(content), full)))
+	L.Push(lua.LNil)
+	return 2
+}
+
+// luaExtSleep blocks the main.lua thread for the given number of seconds.
+// It exists because gopher-lua's oslib has no sleep; main.lua retry loops
+// use it for backoff between model calls. Negative seconds are rejected.
+func luaExtSleep(L *lua.LState) int {
+	secs := L.CheckNumber(1)
+	if secs < 0 {
+		return pushLuaError(L, fmt.Errorf("sleep: seconds must be >= 0 (got %v)", float64(secs)))
+	}
+	time.Sleep(time.Duration(float64(secs) * float64(time.Second)))
+	L.Push(lua.LNil)
+	L.Push(lua.LNil)
+	return 2
+}
+
+// -----------------------------------------------------------------------------
 // json module
 // -----------------------------------------------------------------------------
 
@@ -373,11 +571,11 @@ func (r *Runner) harnessForOpts(system string, reset bool, sel ToolSelector) *ha
 		if system != "" {
 			cfg.SystemPrompt = system
 		}
-		r.sess.h = harness.New(cfg, r.client, reg)
+		r.sess.h = r.newHarness(cfg, reg)
 		return r.sess.h
 	}
 	if r.sess.h == nil {
-		r.sess.h = harness.New(r.cfg, r.client, reg)
+		r.sess.h = r.newHarness(r.cfg, reg)
 	} else {
 		r.sess.h.Registry = reg
 	}

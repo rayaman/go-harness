@@ -1,5 +1,7 @@
 package harness
 
+import "time"
+
 // Config holds everything needed to point the harness at a local model
 // server and control how the agent loop behaves. This is the first place
 // to look if you want to change behavior without touching the core loop.
@@ -67,6 +69,30 @@ type Config struct {
 	// For provider "ollama", this value is also passed as num_ctx to
 	// Client.OllamaChat, so set it to the real window size.
 	MaxContextTokens int
+
+	// RequestTimeout caps how long a single model-server HTTP request may
+	// take before it fails with a timeout. Zero means "keep the client
+	// default" (5 minutes, see harness.NewClient). Workflows set it via
+	// config.request_timeout (a Go duration string like "10m" or "300s").
+	RequestTimeout time.Duration
+
+	// MaxImageDimension is the longest-side pixel cap applied to images
+	// attached to chat requests (see utils.LoadImage). Images whose width
+	// or height exceed it are downscaled proportionally so the longest
+	// side equals the cap; aspect ratio is always preserved and images
+	// are never upscaled. Zero (the default) disables scaling entirely:
+	// images are sent exactly as they sit on disk, with no re-encode.
+	// Workflows set it via config.image_max_dimension (e.g. 2048).
+	MaxImageDimension int
+
+	// StreamThinking requests the model server stream its reply (and any
+	// thinking/reasoning trace) token-by-token instead of buffering the
+	// whole response. The harness forwards deltas to Harness.OnDelta for
+	// live terminal printing; the final Ask() result and History stay
+	// identical to the non-streaming path. False (the default) keeps the
+	// original request/response shape byte-for-byte. The REPL sets it via
+	// --stream-thinking; workflows via config.stream_thinking.
+	StreamThinking bool
 }
 
 // DefaultConfig returns sane defaults for a typical local Ollama setup.

@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"ai-harness/harness"
@@ -319,6 +321,108 @@ harness.log("from lua, arg1 =", harness.args[1])
 	}
 	if !bytes.Contains(out.Bytes(), []byte("from lua, arg1 = cli-arg")) {
 		t.Errorf("harness.log/args not visible: %s", out.String())
+	}
+}
+
+// sseFakeServer emulates an OpenAI-compatible chat endpoint that answers
+// with an SSE stream: reasoning deltas first, then content deltas, then
+// [DONE]. It records each request's "stream" flag so tests can assert the
+// client actually opted into streaming.
+func sseFakeServer(t *testing.T) (*httptest.Server, *[]bool) {
+	t.Helper()
+	var streamFlags []bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/chat/completions":
+			var body map[string]any
+			raw, _ := io.ReadAll(r.Body)
+			if err := json.Unmarshal(raw, &body); err != nil {
+				t.Errorf("sse fake: bad request body: %v", err)
+			}
+			streamFlags = append(streamFlags, body["stream"] == true)
+
+			w.Header().Set("Content-Type", "text/event-stream")
+			flusher, _ := w.(http.Flusher)
+			chunks := []map[string]any{
+				{"choices": []map[string]any{{"delta": map[string]any{"role": "assistant"}}}},
+				{"choices": []map[string]any{{"delta": map[string]any{"reasoning_content": "Hmm, "}}}},
+				{"choices": []map[string]any{{"delta": map[string]any{"reasoning_content": "let me think.\nSecond thought."}}}},
+				{"choices": []map[string]any{{"delta": map[string]any{"content": "Hello "}}}},
+				{"choices": []map[string]any{{"delta": map[string]any{"content": "world"}, "finish_reason": "stop"}}},
+				{"usage": map[string]int{"prompt_tokens": 7, "completion_tokens": 4, "total_tokens": 11}},
+			}
+			for _, c := range chunks {
+				b, _ := json.Marshal(c)
+				fmt.Fprintf(w, "data: %s\n\n", b)
+				if flusher != nil {
+					flusher.Flush()
+				}
+			}
+			fmt.Fprint(w, "data: [DONE]\n\n")
+		case "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{"data": []map[string]any{{"id": "model-a"}}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &streamFlags
+}
+
+func TestRunnerStreamThinking(t *testing.T) {
+	srv, streamFlags := sseFakeServer(t)
+	wf, err := Load(writeWorkflow(t, `
+name: st
+config:
+  stream_thinking: true
+steps:
+  - name: think
+    prompt: "ponder this"
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	base := harness.Config{
+		Provider:          "openai",
+		BaseURL:           srv.URL + "/v1",
+		Model:             "test-model",
+		SystemPrompt:      "SYS",
+		MaxToolIterations: 5,
+		MaxContextTokens:  1000,
+	}
+	var out bytes.Buffer
+	r, err := New(wf, base, &out)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer r.Close()
+
+	if err := r.Run(context.Background(), nil); err != nil {
+		t.Fatalf("Run: %v\noutput: %s", err, out.String())
+	}
+	if len(*streamFlags) != 1 || !(*streamFlags)[0] {
+		t.Errorf("expected one chat request with stream=true, got %v", *streamFlags)
+	}
+	got := out.String()
+	// Thinking deltas must appear live, line-prefixed, split on newlines.
+	if !strings.Contains(got, "[thinking] Hmm, let me think.") ||
+		!strings.Contains(got, "[thinking] Second thought.") {
+		t.Errorf("thinking deltas missing from output:\n%s", got)
+	}
+	// The step result is still the full accumulated content, printed once
+	// at end-of-step (streamed content must not double-print).
+	if r.stepOutputs["think"] != "Hello world" {
+		t.Errorf("step result: got %q, want %q", r.stepOutputs["think"], "Hello world")
+	}
+	if strings.Count(got, "Hello world") != 1 {
+		t.Errorf("streamed content should print exactly once, output:\n%s", got)
+	}
+	// Thinking lines must precede the result line.
+	iThink := strings.Index(got, "[thinking] Hmm,")
+	iResult := strings.Index(got, "Hello world\n")
+	if iThink < 0 || iResult < 0 || iThink > iResult {
+		t.Errorf("expected thinking before result, output:\n%s", got)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"ai-harness/harness"
 )
@@ -78,7 +79,10 @@ func TestLoadMergeConfig(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 	base := harness.Config{Model: "base", Temperature: 0.9, Provider: "ollama", MaxToolIterations: 5}
-	got := wf.MergeConfig(base)
+	got, err := wf.MergeConfig(base)
+	if err != nil {
+		t.Fatalf("MergeConfig: %v", err)
+	}
 	if got.Model != "over" {
 		t.Errorf("model: got %q", got.Model)
 	}
@@ -87,6 +91,116 @@ func TestLoadMergeConfig(t *testing.T) {
 	}
 	if got.Provider != "ollama" || got.MaxToolIterations != 5 {
 		t.Errorf("unset fields must keep base values: %+v", got)
+	}
+}
+
+func TestLoadRequestTimeoutMerges(t *testing.T) {
+	dir := writeWorkflow(t, "name: rt\nconfig:\n  request_timeout: 10m\nsteps:\n  - name: a\n    prompt: x\n")
+	wf, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got, err := wf.MergeConfig(harness.Config{})
+	if err != nil {
+		t.Fatalf("MergeConfig: %v", err)
+	}
+	if got.RequestTimeout != 10*time.Minute {
+		t.Errorf("request_timeout: got %v, want 10m", got.RequestTimeout)
+	}
+	// Unset override must leave the zero value, so the client keeps its 5m default.
+	wf2, err := Load(writeWorkflow(t, "name: rt0\nconfig:\n  model: m\nsteps:\n  - name: a\n    prompt: x\n"))
+	if err != nil {
+		t.Fatalf("Load (unset): %v", err)
+	}
+	got2, err := wf2.MergeConfig(harness.Config{})
+	if err != nil {
+		t.Fatalf("MergeConfig (unset): %v", err)
+	}
+	if got2.RequestTimeout != 0 {
+		t.Errorf("unset request_timeout should stay zero, got %v", got2.RequestTimeout)
+	}
+}
+
+func TestLoadStreamThinkingMerges(t *testing.T) {
+	dir := writeWorkflow(t, "name: st\nconfig:\n  stream_thinking: true\nsteps:\n  - name: a\n    prompt: x\n")
+	wf, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got, err := wf.MergeConfig(harness.Config{})
+	if err != nil {
+		t.Fatalf("MergeConfig: %v", err)
+	}
+	if !got.StreamThinking {
+		t.Errorf("stream_thinking: got false, want true")
+	}
+	// Unset override must keep the base value (normally false).
+	wf2, err := Load(writeWorkflow(t, "name: st0\nconfig:\n  model: m\nsteps:\n  - name: a\n    prompt: x\n"))
+	if err != nil {
+		t.Fatalf("Load (unset): %v", err)
+	}
+	got2, err := wf2.MergeConfig(harness.Config{})
+	if err != nil {
+		t.Fatalf("MergeConfig (unset): %v", err)
+	}
+	if got2.StreamThinking {
+		t.Errorf("unset stream_thinking should stay false, got true")
+	}
+}
+
+func TestLoadRequestTimeoutInvalid(t *testing.T) {
+	wf, err := Load(writeWorkflow(t, "name: rt\nconfig:\n  request_timeout: 10 minutes\nsteps:\n  - name: a\n    prompt: x\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if _, err := wf.MergeConfig(harness.Config{}); err == nil {
+		t.Fatal("expected invalid request_timeout to be an error")
+	} else if !strings.Contains(err.Error(), `invalid request_timeout "10 minutes"`) {
+		t.Errorf("error should name the bad value, got: %v", err)
+	}
+}
+
+func TestLoadImageMaxDimensionMerges(t *testing.T) {
+	dir := writeWorkflow(t, "name: imd\nconfig:\n  image_max_dimension: 2048\nsteps:\n  - name: a\n    prompt: x\n")
+	wf, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got, err := wf.MergeConfig(harness.Config{})
+	if err != nil {
+		t.Fatalf("MergeConfig: %v", err)
+	}
+	if got.MaxImageDimension != 2048 {
+		t.Errorf("image_max_dimension: got %d, want 2048", got.MaxImageDimension)
+	}
+	// Unset override must leave the zero value, meaning "no scaling".
+	wf2, err := Load(writeWorkflow(t, "name: imd0\nconfig:\n  model: m\nsteps:\n  - name: a\n    prompt: x\n"))
+	if err != nil {
+		t.Fatalf("Load (unset): %v", err)
+	}
+	got2, err := wf2.MergeConfig(harness.Config{})
+	if err != nil {
+		t.Fatalf("MergeConfig (unset): %v", err)
+	}
+	if got2.MaxImageDimension != 0 {
+		t.Errorf("unset image_max_dimension should stay zero, got %d", got2.MaxImageDimension)
+	}
+}
+
+func TestLoadImageMaxDimensionInvalid(t *testing.T) {
+	for _, body := range []string{
+		"name: imd\nconfig:\n  image_max_dimension: 0\nsteps:\n  - name: a\n    prompt: x\n",
+		"name: imd\nconfig:\n  image_max_dimension: -5\nsteps:\n  - name: a\n    prompt: x\n",
+	} {
+		wf, err := Load(writeWorkflow(t, body))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if _, err := wf.MergeConfig(harness.Config{}); err == nil {
+			t.Fatalf("expected non-positive image_max_dimension to be an error (%q)", body)
+		} else if !strings.Contains(err.Error(), "invalid image_max_dimension") {
+			t.Errorf("error should name the bad key, got: %v", err)
+		}
 	}
 }
 

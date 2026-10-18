@@ -47,6 +47,13 @@ config:                      # partial overrides merged onto the base preset
   temperature: 0.3
   max_tool_iterations: 25
   max_context_tokens: 0      # 0 = auto-probe the server for the real window
+  request_timeout: 10m       # per-request HTTP timeout (Go duration: "10m", "300s"); default 5m
+  image_max_dimension: 2048  # downscale attached images to this longest-side pixel cap
+                             # (0/absent = send images exactly as on disk; aspect ratio
+                             # is always preserved and images are never upscaled)
+  stream_thinking: true      # workflow-level bool, default false: stream the model's
+                             # thinking/reasoning output live to the terminal (printed
+                             # as "[thinking] ..." lines; step results print as normal)
 
 tools:
   builtin: [current_time, read_file, list_files]  # names, or [all], or []
@@ -97,7 +104,9 @@ pass before being sent:
 
 The VM also ships the sandboxed `http` and `filesystem` modules from
 [`harness/lua-tool`](../harness/lua-tool/README.md) (filesystem BaseDir =
-the workflow's `work_dir`).
+the workflow's `work_dir`). Both are reached with
+`local fs = require("filesystem")` and they reject paths that escape
+`work_dir` - use `harness.external` below for human-supplied paths.
 
 | Call | Returns |
 |---|---|
@@ -111,7 +120,21 @@ the workflow's `work_dir`).
 | `harness.step_results()` | `{name = output, ...}` |
 | `harness.vars` / `harness.args` | workflow vars / CLI args after `--` |
 | `harness.log(...)` | stdout |
+| `harness.external.abspath(p)` | absolute path, err (relative to CWD) |
+| `harness.external.exists(p)` / `.is_dir(p)` | `true/false, err` (missing path = `false, nil`) |
+| `harness.external.mkdir(p)` | created dir, err (`os.MkdirAll`) |
+| `harness.external.list_images(dir)` | sorted absolute paths of png/jpg/jpeg/gif/webp files, err (recursive) |
+| `harness.external.read_file(p)` | `text, err` |
+| `harness.external.write_file(p, content)` | `message, err` (parent dirs auto-created) |
 | `json.encode(t)` / `json.decode(s)` | table ⇄ JSON string |
+
+`harness.external.*` deliberately bypasses the workflow-dir sandbox. The
+safety model is provenance: these functions only exist inside the
+`main.lua` VM, never in the model's tool registry, so they can only ever
+touch paths the *human* supplied (prompt answers, CLI args) - main.lua
+must keep model-generated text out of those paths. For images,
+`harness.ask_media`/`media:` also accept absolute paths outside the
+workflow directory.
 
 `opts` table keys: `model`, `temperature`, `media = {paths}`, `system`
 (fresh conversation with this persona), `reset = true`, `tools = "none" |
@@ -130,6 +153,25 @@ tool contract (`name()`, `description()`, `parameters()`, `execute(args)`)
 selected by name in `tools.builtin`; available names: `current_time`,
 `read_file`, `list_files`, `read_file_partial`, `get_file_size`,
 `edit_file`, `write_file`.
+
+## Sample: manga-translator
+
+[`workflows/manga-translator/`](../workflows/manga-translator/) translates
+a directory of manga/comic page images, writing one `<page>.md` per image
+(Technical Translation Framework: narrative context, spatial position,
+speaker + psychological state, dual-language lines, SFX treatment) plus a
+running `summary.md` that is fed into every later page's prompt. Its
+system prompt explicitly authorizes faithful translation of fictional
+adult (18+) source material. It prompts for the input/output directories
+(or takes them as args) and uses `harness.external` for all out-of-dir IO:
+
+```
+go run main.go --workflow workflows/manga-translator
+go run main.go --workflow workflows/manga-translator -- "C:\manga\ch01" "C:\manga\out" Japanese English
+```
+
+Re-running skips pages whose `.md` already exists in the output dir
+(delete a page's `.md` to redo just that page).
 
 ## Tests
 
