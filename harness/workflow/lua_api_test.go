@@ -225,3 +225,49 @@ func TestShippedMangaTranslatorWorkflow(t *testing.T) {
 		t.Errorf("resume output missing skip report: %s", out2.String())
 	}
 }
+
+// TestStepJSONLuaAPI drives a schema step plus a plain step from main.lua:
+// harness.step_json returns the decoded value as a Lua table with the
+// right keys/types, nil for the no-schema step, and step_results() keeps
+// returning the raw text exactly as before (roadmap 2.5).
+func TestStepJSONLuaAPI(t *testing.T) {
+	f := newFakeServer(t, `{"title": "Hello", "count": 42, "ok": true, "tags": ["a", "b"], "meta": {"k": "x"}}`)
+	dir := writeWorkflow(t, "name: stepjson\nsteps:\n  - name: s1\n    prompt: Extract\n    schema:\n      type: object\n      required: [title]\n  - name: plain\n    prompt: prose step\n")
+	script := `
+local text, err = harness.run_step("s1")
+if not text then error("run_step s1: " .. err) end
+local _, perr = harness.run_step("plain")
+if perr then error("run_step plain: " .. perr) end
+
+local v = harness.step_json("s1")
+assert(v, "step_json should return a table for a schema step")
+assert(v.title == "Hello", "title: " .. tostring(v.title))
+assert(type(v.count) == "number" and v.count == 42, "count: " .. tostring(v.count))
+assert(v.ok == true, "ok should be Lua true")
+assert(type(v.tags) == "table", "tags should be a table")
+assert(#v.tags == 2 and v.tags[1] == "a" and v.tags[2] == "b", "tags array contents")
+assert(type(v.meta) == "table" and v.meta.k == "x", "meta object")
+
+assert(harness.step_json("plain") == nil, "no-schema step should be nil")
+assert(harness.step_json("nosuch") == nil, "unknown step should be nil")
+
+local res = harness.step_results()
+assert(res.s1 == text, "step_results must keep returning raw text")
+harness.log("step_json ok")
+`
+	if err := os.WriteFile(filepath.Join(dir, LuaMainName), []byte(script), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wf, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	var out bytes.Buffer
+	r, _ := mustRunner(t, wf, f, &out)
+	if err := r.Run(context.Background(), nil); err != nil {
+		t.Fatalf("Run: %v\noutput: %s", err, out.String())
+	}
+	if !bytes.Contains(out.Bytes(), []byte("step_json ok")) {
+		t.Fatalf("assertions did not pass: %s", out.String())
+	}
+}

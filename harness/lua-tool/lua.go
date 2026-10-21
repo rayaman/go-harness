@@ -61,6 +61,14 @@ func NewLuaToolFromScriptWithConfig(script string, fsCfg FilesystemConfig) (*Lua
 	return tool, nil
 }
 
+// Serial reports true: the tool's Execute runs against the shared
+// gopher-lua VM (t.L), and Lua VMs are NOT goroutine-safe. The mutex in
+// Execute already prevents data races, but reporting Serial keeps the
+// harness's parallel scheduler (roadmap 2.1, harness.SerialTyper) from
+// ever queueing two calls of this tool into the concurrent pool, so the
+// VM is only ever entered one call at a time.
+func (t *LuaTool) Serial() bool { return true }
+
 func (t *LuaTool) Close() {
 	t.mu.Lock()
 	defer t.mu.Unlock()

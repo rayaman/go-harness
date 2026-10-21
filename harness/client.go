@@ -5,9 +5,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -21,6 +24,13 @@ type Client struct {
 	baseURL    string
 	apiKey     string
 	httpClient *http.Client
+
+	// maxRetries is the number of EXTRA attempts the chat-completion
+	// entry points make after a retryable failure (roadmap 1.4). 0 (the
+	// zero value) disables retrying entirely, preserving the original
+	// single-attempt behavior; Config.MaxRetries flows here via
+	// SetMaxRetries.
+	maxRetries int
 }
 
 // NewClient builds a Client pointed at baseURL (e.g. "http://localhost:11434/v1").
@@ -48,18 +58,155 @@ func (c *Client) SetRequestTimeout(d time.Duration) {
 	c.httpClient.Timeout = d
 }
 
+// SetMaxRetries enables retrying on the four chat-completion entry points
+// (ChatCompletion, ChatCompletionStream, OllamaChat, OllamaChatStream).
+// n is the number of EXTRA attempts after the first, so n = 2 means at
+// most 3 tries; n <= 0 disables retrying (the zero value and the
+// pre-retry behavior). Mirrors SetRequestTimeout: harness.New and the
+// workflow runner call it from Config.MaxRetries.
+func (c *Client) SetMaxRetries(n int) {
+	if n < 0 {
+		n = 0
+	}
+	c.maxRetries = n
+}
+
+// ---------------------------------------------------------------------------
+// Retry policy (roadmap 1.4)
+//
+// The four chat-completion entry points share ONE retry helper: each is an
+// outer wrapper that calls retry() around a single-attempt function which
+// also reports whether its error was retryable.
+// ---------------------------------------------------------------------------
+
+// retryBaseDelay is the first backoff wait; each subsequent retry doubles
+// it (1s, 2s, 4s). A package-level var so tests can shrink it.
+var retryBaseDelay = time.Second
+
+// retryAfterCap bounds a server-sent Retry-After wait (429/503) so a bogus
+// huge value can never stall the agent loop for hours.
+const retryAfterCap = 60 * time.Second
+
+// httpStatusError is a non-2xx model-server reply, typed so the retry
+// policy can classify on StatusCode instead of string matching. Error()
+// keeps the historical wording verbatim: "model server returned %d: %s"
+// for the chat entry points, and "<url> returned %d: %s" for the
+// auxiliary doJSON endpoints (Source carries the URL there), so existing
+// error-string expectations elsewhere are unaffected.
+type httpStatusError struct {
+	StatusCode int
+	Body       string
+	RetryAfter string // raw Retry-After response header, "" when absent
+	Source     string // error() subject; "" means "model server"
+}
+
+func (e *httpStatusError) Error() string {
+	source := e.Source
+	if source == "" {
+		source = "model server"
+	}
+	return fmt.Sprintf("%s returned %d: %s", source, e.StatusCode, e.Body)
+}
+
+// isRetryableStatus classifies a model-server status: 408, 429 and every
+// 5xx are transient and retried; all other statuses are not.
+func isRetryableStatus(status int) bool {
+	return status == http.StatusRequestTimeout ||
+		status == http.StatusTooManyRequests ||
+		status >= 500
+}
+
+// retry runs attempt until it succeeds, hits a non-retryable error, or
+// burns through maxRetries extra attempts (so up to maxRetries+1 tries
+// total). attempt's bool return marks its error retryable: transport
+// failures and retryable statuses report true; build/marshal/parse errors
+// report false. Backoff is exponential from retryBaseDelay, overridden by
+// an integer-seconds Retry-After header on 429/503, and always
+// cancellable via ctx.
+func retry[T any](ctx context.Context, maxRetries int, attempt func() (T, bool, error)) (T, error) {
+	var zero T
+	for i := 0; ; i++ {
+		result, retryable, err := attempt()
+		if err == nil {
+			return result, nil
+		}
+		if !retryable || i >= maxRetries {
+			return zero, err
+		}
+		log.Printf("model server request failed (attempt %d/%d, retrying): %v", i+1, maxRetries+1, err)
+		if waitErr := sleepBackoff(ctx, i, err); waitErr != nil {
+			return zero, waitErr
+		}
+	}
+}
+
+// sleepBackoff waits before retry index+1: an integer-seconds Retry-After
+// header (429/503 only, capped at retryAfterCap) wins over the
+// exponential retryBaseDelay doubling schedule (1s, 2s, 4s, ...; the
+// shift is capped so a large maxRetries can't overflow). A canceled ctx
+// short-circuits and is returned.
+func sleepBackoff(ctx context.Context, retryIndex int, err error) error {
+	wait, ok := retryAfterSeconds(err)
+	if !ok {
+		shift := retryIndex
+		if shift > 6 {
+			shift = 6
+		}
+		wait = retryBaseDelay << shift
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// retryAfterSeconds parses an integer-seconds Retry-After header off an
+// httpStatusError for 429/503. HTTP-date Retry-After values are not
+// supported (local model servers send integers). Absent, unparsable, or
+// non-positive falls back to normal backoff (ok = false).
+func retryAfterSeconds(err error) (time.Duration, bool) {
+	var statusErr *httpStatusError
+	if !errors.As(err, &statusErr) {
+		return 0, false
+	}
+	if statusErr.StatusCode != http.StatusTooManyRequests && statusErr.StatusCode != http.StatusServiceUnavailable {
+		return 0, false
+	}
+	secs, convErr := strconv.Atoi(strings.TrimSpace(statusErr.RetryAfter))
+	if convErr != nil || secs <= 0 {
+		return 0, false
+	}
+	if d := time.Duration(secs) * time.Second; d < retryAfterCap {
+		return d, true
+	}
+	return retryAfterCap, true
+}
+
 // ChatCompletion sends the full conversation (plus optional tool schemas)
-// to the model server and returns its parsed response.
+// to the model server and returns its parsed response. Transient failures
+// (transport errors, 408/429/5xx) are retried per Client.maxRetries with
+// exponential backoff; see retry for the shared policy.
 func (c *Client) ChatCompletion(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
+	return retry(ctx, c.maxRetries, func() (*ChatResponse, bool, error) {
+		return c.chatCompletionAttempt(ctx, body)
+	})
+}
 
+// chatCompletionAttempt is one wire attempt of ChatCompletion. The bool
+// return marks the error retryable for the retry helper.
+func (c *Client) chatCompletionAttempt(ctx context.Context, body []byte) (*ChatResponse, bool, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		c.baseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
+		return nil, false, fmt.Errorf("build request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	if c.apiKey != "" {
@@ -71,24 +218,28 @@ func (c *Client) ChatCompletion(ctx context.Context, req ChatRequest) (*ChatResp
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("request to model server failed (is it running at %s?): %w", c.baseURL, err)
+		return nil, true, fmt.Errorf("request to model server failed (is it running at %s?): %w", c.baseURL, err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
+		return nil, true, fmt.Errorf("read response: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("model server returned %d: %s", resp.StatusCode, string(respBody))
+		return nil, isRetryableStatus(resp.StatusCode), &httpStatusError{
+			StatusCode: resp.StatusCode,
+			Body:       string(respBody),
+			RetryAfter: resp.Header.Get("Retry-After"),
+		}
 	}
 
 	var chatResp ChatResponse
 	if err := json.Unmarshal(respBody, &chatResp); err != nil {
-		return nil, fmt.Errorf("parse response: %w (body: %s)", err, string(respBody))
+		return nil, false, fmt.Errorf("parse response: %w (body: %s)", err, string(respBody))
 	}
-	return &chatResp, nil
+	return &chatResp, false, nil
 }
 
 // ChatCompletionStream is ChatCompletion with "stream": true: instead of one
@@ -99,17 +250,32 @@ func (c *Client) ChatCompletion(ctx context.Context, req ChatRequest) (*ChatResp
 // from their deltas - is returned in the same ChatResponse shape the
 // non-streaming path produces, so callers can reuse it unchanged for
 // History and usage.
+//
+// Streaming retry caveat (roadmap 1.4): a failed attempt is only retried
+// while no delta has been forwarded to onDelta yet; once the caller has
+// seen partial output, replaying the stream would duplicate it, so the
+// error is returned as-is.
 func (c *Client) ChatCompletionStream(ctx context.Context, req ChatRequest, onDelta func(ChatDelta)) (*ChatResponse, error) {
 	req.Stream = true
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
+	started := false
+	return retry(ctx, c.maxRetries, func() (*ChatResponse, bool, error) {
+		return c.chatCompletionStreamAttempt(ctx, body, onDelta, &started)
+	})
+}
 
+// chatCompletionStreamAttempt is one wire attempt of ChatCompletionStream.
+// The bool return marks the error retryable: transport and status errors
+// are (they happen before any delta), stream read/parse failures only
+// while *started is still false.
+func (c *Client) chatCompletionStreamAttempt(ctx context.Context, body []byte, onDelta func(ChatDelta), started *bool) (*ChatResponse, bool, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		c.baseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
+		return nil, false, fmt.Errorf("build request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "text/event-stream")
@@ -119,13 +285,17 @@ func (c *Client) ChatCompletionStream(ctx context.Context, req ChatRequest, onDe
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("request to model server failed (is it running at %s?): %w", c.baseURL, err)
+		return nil, true, fmt.Errorf("request to model server failed (is it running at %s?): %w", c.baseURL, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("model server returned %d: %s", resp.StatusCode, string(respBody))
+		return nil, isRetryableStatus(resp.StatusCode), &httpStatusError{
+			StatusCode: resp.StatusCode,
+			Body:       string(respBody),
+			RetryAfter: resp.Header.Get("Retry-After"),
+		}
 	}
 
 	var (
@@ -180,7 +350,9 @@ func (c *Client) ChatCompletionStream(ctx context.Context, req ChatRequest, onDe
 			Usage *Usage `json:"usage"`
 		}
 		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
-			return nil, fmt.Errorf("parse stream chunk: %w (chunk: %s)", err, payload)
+			// Parse errors are never retryable (bad payload won't fix
+			// itself on a resend).
+			return nil, false, fmt.Errorf("parse stream chunk: %w (chunk: %s)", err, payload)
 		}
 		if chunk.Usage != nil && chunk.Usage.TotalTokens != 0 {
 			usage = *chunk.Usage
@@ -194,12 +366,14 @@ func (c *Client) ChatCompletionStream(ctx context.Context, req ChatRequest, onDe
 				content.WriteString(ch.Delta.Content)
 				if onDelta != nil {
 					onDelta(ChatDelta{Content: ch.Delta.Content})
+					*started = true
 				}
 			}
 			if thinking := ch.Delta.ReasoningContent + ch.Delta.Thinking; thinking != "" {
 				reasoning.WriteString(thinking)
 				if onDelta != nil {
 					onDelta(ChatDelta{ReasoningContent: thinking})
+					*started = true
 				}
 			}
 			// Tool calls stream as fragments keyed by index: the first
@@ -223,7 +397,9 @@ func (c *Client) ChatCompletionStream(ctx context.Context, req ChatRequest, onDe
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("read stream: %w", err)
+		// A dropped stream is transport-ish: retry only while no delta
+		// has been forwarded yet (started == false).
+		return nil, !(*started), fmt.Errorf("read stream: %w", err)
 	}
 
 	var toolCalls []ToolCall
@@ -256,7 +432,7 @@ func (c *Client) ChatCompletionStream(ctx context.Context, req ChatRequest, onDe
 			},
 		},
 		Usage: usage,
-	}, nil
+	}, false, nil
 }
 
 // ollamaArgumentsToObject parses a FunctionCall.Arguments JSON string back
@@ -374,11 +550,22 @@ func convertOllamaToolCalls(calls []ollamaToolCall) ([]ToolCall, error) {
 // response back into the wire ChatResponse shape so the agent loop stays
 // unchanged. Pass numCtx <= 0 to keep the server's default context window;
 // harness.go passes Config.MaxContextTokens.
+//
+// Transient failures (transport errors, 408/429/5xx) are retried per
+// Client.maxRetries; see retry for the shared policy.
 func (c *Client) OllamaChat(ctx context.Context, req ChatRequest, numCtx int) (*ChatResponse, error) {
-	respBody, err := c.doJSON(ctx, http.MethodPost, c.rootURL()+"/api/chat",
+	return retry(ctx, c.maxRetries, func() (*ChatResponse, bool, error) {
+		return c.ollamaChatAttempt(ctx, req, numCtx)
+	})
+}
+
+// ollamaChatAttempt is one wire attempt of OllamaChat. The bool return
+// marks the error retryable for the retry helper.
+func (c *Client) ollamaChatAttempt(ctx context.Context, req ChatRequest, numCtx int) (*ChatResponse, bool, error) {
+	respBody, retryable, err := c.doJSONRetryable(ctx, http.MethodPost, c.rootURL()+"/api/chat",
 		ollamaChatBody(req, numCtx, false, false))
 	if err != nil {
-		return nil, err
+		return nil, retryable, err
 	}
 
 	var parsed struct {
@@ -393,12 +580,12 @@ func (c *Client) OllamaChat(ctx context.Context, req ChatRequest, numCtx int) (*
 		} `json:"message"`
 	}
 	if err := json.Unmarshal(respBody, &parsed); err != nil {
-		return nil, fmt.Errorf("parse native response: %w (body: %s)", err, string(respBody))
+		return nil, false, fmt.Errorf("parse native response: %w (body: %s)", err, string(respBody))
 	}
 
 	toolCalls, err := convertOllamaToolCalls(parsed.Message.ToolCalls)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	return &ChatResponse{
@@ -416,7 +603,7 @@ func (c *Client) OllamaChat(ctx context.Context, req ChatRequest, numCtx int) (*
 				FinishReason: "stop",
 			},
 		},
-	}, nil
+	}, false, nil
 }
 
 // OllamaChatStream is OllamaChat with Ollama's native streaming: "stream":
@@ -433,16 +620,29 @@ func (c *Client) OllamaChat(ctx context.Context, req ChatRequest, numCtx int) (*
 // models that emit thinking by default (deepseek-r1 and friends) populate
 // message.thinking either way, which we parse regardless of which path
 // produced it.
+//
+// Streaming retry caveat (roadmap 1.4): like ChatCompletionStream, a
+// failed attempt is only retried while no delta has been forwarded to
+// onDelta yet; a mid-flight failure is returned as-is.
 func (c *Client) OllamaChatStream(ctx context.Context, req ChatRequest, numCtx int, onDelta func(ChatDelta)) (*ChatResponse, error) {
 	bodyBytes, err := json.Marshal(ollamaChatBody(req, numCtx, true, true))
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
+	started := false
+	return retry(ctx, c.maxRetries, func() (*ChatResponse, bool, error) {
+		return c.ollamaChatStreamAttempt(ctx, bodyBytes, onDelta, &started)
+	})
+}
 
+// ollamaChatStreamAttempt is one wire attempt of OllamaChatStream. The
+// bool return marks the error retryable: transport and status errors are,
+// stream read/parse failures only while *started is still false.
+func (c *Client) ollamaChatStreamAttempt(ctx context.Context, bodyBytes []byte, onDelta func(ChatDelta), started *bool) (*ChatResponse, bool, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		c.rootURL()+"/api/chat", bytes.NewReader(bodyBytes))
 	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
+		return nil, false, fmt.Errorf("build request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	if c.apiKey != "" {
@@ -451,13 +651,17 @@ func (c *Client) OllamaChatStream(ctx context.Context, req ChatRequest, numCtx i
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("request to model server failed (is it running at %s?): %w", c.baseURL, err)
+		return nil, true, fmt.Errorf("request to model server failed (is it running at %s?): %w", c.baseURL, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("model server returned %d: %s", resp.StatusCode, string(respBody))
+		return nil, isRetryableStatus(resp.StatusCode), &httpStatusError{
+			StatusCode: resp.StatusCode,
+			Body:       string(respBody),
+			RetryAfter: resp.Header.Get("Retry-After"),
+		}
 	}
 
 	var (
@@ -486,18 +690,22 @@ func (c *Client) OllamaChatStream(ctx context.Context, req ChatRequest, numCtx i
 			EvalCount       int  `json:"eval_count"`
 		}
 		if err := json.Unmarshal(line, &chunk); err != nil {
-			return nil, fmt.Errorf("parse native stream chunk: %w (chunk: %s)", err, line)
+			// Parse errors are never retryable (bad payload won't fix
+			// itself on a resend).
+			return nil, false, fmt.Errorf("parse native stream chunk: %w (chunk: %s)", err, line)
 		}
 		if chunk.Message.Content != "" {
 			content.WriteString(chunk.Message.Content)
 			if onDelta != nil {
 				onDelta(ChatDelta{Content: chunk.Message.Content})
+				*started = true
 			}
 		}
 		if chunk.Message.Thinking != "" {
 			reasoning.WriteString(chunk.Message.Thinking)
 			if onDelta != nil {
 				onDelta(ChatDelta{ReasoningContent: chunk.Message.Thinking})
+				*started = true
 			}
 		}
 		if len(chunk.Message.ToolCalls) > 0 {
@@ -506,7 +714,7 @@ func (c *Client) OllamaChatStream(ctx context.Context, req ChatRequest, numCtx i
 			// is enough.
 			converted, err := convertOllamaToolCalls(chunk.Message.ToolCalls)
 			if err != nil {
-				return nil, err
+				return nil, false, err
 			}
 			toolCalls = append(toolCalls, converted...)
 		}
@@ -522,7 +730,9 @@ func (c *Client) OllamaChatStream(ctx context.Context, req ChatRequest, numCtx i
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("read stream: %w", err)
+		// A dropped stream is transport-ish: retry only while no delta
+		// has been forwarded yet (started == false).
+		return nil, !(*started), fmt.Errorf("read stream: %w", err)
 	}
 
 	return &ChatResponse{
@@ -541,7 +751,7 @@ func (c *Client) OllamaChatStream(ctx context.Context, req ChatRequest, numCtx i
 			},
 		},
 		Usage: usage,
-	}, nil
+	}, false, nil
 }
 
 // rootURL strips a trailing "/v1" so we can also reach native endpoints
@@ -557,18 +767,29 @@ func (c *Client) rootURL() string {
 // header as ChatCompletion and returns the raw response body. Pass a nil
 // reqBody for a GET with no body.
 func (c *Client) doJSON(ctx context.Context, method, url string, reqBody any) ([]byte, error) {
+	body, _, err := c.doJSONRetryable(ctx, method, url, reqBody)
+	return body, err
+}
+
+// doJSONRetryable is doJSON plus the retryability flag the chat entry
+// points' retry wrappers use: transport/read failures are retryable,
+// non-2xx statuses defer to isRetryableStatus, build/marshal failures are
+// not. Note that its status error message is the generic
+// "%s returned %d: %s" (not the "model server returned" wording), which
+// only matters to the auxiliary endpoints that never retry.
+func (c *Client) doJSONRetryable(ctx context.Context, method, url string, reqBody any) ([]byte, bool, error) {
 	var reader io.Reader
 	if reqBody != nil {
 		b, err := json.Marshal(reqBody)
 		if err != nil {
-			return nil, fmt.Errorf("marshal request: %w", err)
+			return nil, false, fmt.Errorf("marshal request: %w", err)
 		}
 		reader = bytes.NewReader(b)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, method, url, reader)
 	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
+		return nil, false, fmt.Errorf("build request: %w", err)
 	}
 	if reqBody != nil {
 		req.Header.Set("Content-Type", "application/json")
@@ -579,18 +800,23 @@ func (c *Client) doJSON(ctx context.Context, method, url string, reqBody any) ([
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("request to %s failed: %w", url, err)
+		return nil, true, fmt.Errorf("request to %s failed: %w", url, err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("read response from %s: %w", url, err)
+		return nil, true, fmt.Errorf("read response from %s: %w", url, err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("%s returned %d: %s", url, resp.StatusCode, string(respBody))
+		return nil, isRetryableStatus(resp.StatusCode), &httpStatusError{
+			StatusCode: resp.StatusCode,
+			Body:       string(respBody),
+			RetryAfter: resp.Header.Get("Retry-After"),
+			Source:     url, // keeps the historic "<url> returned %d: %s" wording
+		}
 	}
-	return respBody, nil
+	return respBody, false, nil
 }
 
 // ModelInfo describes one model as reported by the model server.

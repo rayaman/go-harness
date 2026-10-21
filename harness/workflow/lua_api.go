@@ -33,6 +33,11 @@ import (
 //	harness.set_system_prompt("persona")       // resets the shared conversation
 //	harness.set_model("model")                 // changes the default model
 //	harness.step_results()                     -> {step_name = output, ...}
+//	harness.step_json(name)                    -> decoded JSON table for a
+//	                                             schema step, nil if none
+//	                                             (step_results() keeps
+//	                                             returning raw text only,
+//	                                             for backward compat)
 //	harness.vars                               -> workflow vars table
 //	harness.args                               -> extra CLI args table
 //	harness.log(...)                           -> stdout logging
@@ -80,6 +85,7 @@ func (r *Runner) registerHarnessModule(L *lua.LState, ctx context.Context) {
 			"set_system_prompt": r.luaSetSystemPrompt,
 			"set_model":         r.luaSetModel,
 			"step_results":      r.luaStepResults,
+			"step_json":         r.luaStepJSON,
 			"log":               r.luaLog,
 		})
 		tbl.RawSetString("external", newExternalTable(L))
@@ -329,6 +335,24 @@ func (r *Runner) luaSetModel(L *lua.LState) int {
 
 func (r *Runner) luaStepResults(L *lua.LState) int {
 	L.Push(luatool.GoToLua(L, mapAny(r.stepOutputs)))
+	return 1
+}
+
+// luaStepJSON returns the decoded JSON value of a schema-validated step
+// (roadmap 2.5) as a Lua table - numbers -> number, strings -> string,
+// bools -> bool, arrays -> 1-based tables, objects -> keyed tables - or
+// nil when the step had no schema / no decoded value. step_results()
+// deliberately keeps returning name -> raw text exactly as before:
+// existing workflows read outputs as strings, so nesting a .json table
+// under it (the roadmap's original wording) would break them.
+func (r *Runner) luaStepJSON(L *lua.LState) int {
+	name := L.CheckString(1)
+	decoded, ok := r.stepJSON[name]
+	if !ok {
+		L.Push(lua.LNil)
+		return 1
+	}
+	L.Push(luatool.GoToLua(L, decoded))
 	return 1
 }
 

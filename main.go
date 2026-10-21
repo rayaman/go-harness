@@ -5,13 +5,16 @@ import (
 	"ai-harness/harness"
 	"ai-harness/harness/config"
 	luatool "ai-harness/harness/lua-tool"
+	"ai-harness/harness/mcp"
 	"ai-harness/harness/tools"
 	"ai-harness/harness/workflow"
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"time"
@@ -37,7 +40,7 @@ func main() {
 	}
 	// ---------------------------------------------------------------------
 
-	cfg := harness.OllamaConfig()
+	cfg := harness.StrataConfig()
 	conf := config.GetConfig()
 
 	// --- Edit these to point at a different model/server -------------
@@ -68,7 +71,52 @@ func main() {
 	registry.Register(tools.GetFileSizeTool{BaseDir: "."})
 	registry.Register(tools.EditFileTool{BaseDir: "."})
 	registry.Register(tools.WriteFileTool{BaseDir: "."})
+	registry.Register(tools.ShellTool{BaseDir: "."})
+	// Web tools (roadmap 2.3) are read-only, so the default PolicyAllow
+	// applies; config's tool-permissions lists can still gate them via
+	// applyToolPolicies below.
+	registry.Register(tools.WebFetchTool{})
+	registry.Register(tools.WebSearchTool{})
 	bdotools.RegisterMarketTools(registry)
+
+	// MCP tool servers (roadmap 2.2): spawn each configured server over
+	// stdio and register its discovered tools. A failing server is a
+	// warning, never a startup abort. The MCP tools keep the Registry's
+	// zero-value PolicyAllow, but that is the same default applyToolPolicies
+	// below encodes for unlisted names, and any explicit
+	// tool-permissions entry for an MCP tool name still wins, because
+	// ApplyPolicies is keyed purely by name.
+	var mcpClients []*mcp.Client
+	defer func() {
+		for _, c := range mcpClients {
+			_ = c.Close() // also terminates the server process
+		}
+	}()
+	// Bounded startup so an MCP server that never answers tools/list
+	// can't hang the REPL; the registered tools use their own context
+	// at call time, so this one is cancelled once startup finishes.
+	ctx0, cancelMCPStartup := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelMCPStartup()
+	for _, srv := range conf.MCPServers {
+		client, _, err := mcp.StartServer(srv.Command, srv.Args, nil)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to start MCP server %q (%s): %v\n", srv.Name, srv.Command, err)
+			continue
+		}
+		mcpClients = append(mcpClients, client)
+		n, err := mcp.LoadTools(ctx0, client, registry, srv.Name)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to load tools from MCP server %q: %v\n", srv.Name, err)
+			continue
+		}
+		fmt.Printf("Loaded %d MCP tools from server %q\n", n, srv.Name)
+	}
+
+	// Permission policies (roadmap 1.2): config.yaml's tool-permissions
+	// lists plus a default ask for run_shell_command. applyToolPolicies
+	// runs again on hot-reload below, so config edits take effect
+	// without restarting the REPL.
+	applyToolPolicies(conf, registry)
 
 	// --- Dynamic Custom Lua Tools Loader -------------------------------
 	defaultConfigDir := "agent/custom_tools"
@@ -106,7 +154,40 @@ func main() {
 
 	cfg.StreamThinking = *streamThinking
 
+	// Persistent memory (roadmap 2.4): config.yaml's memory-file picks
+	// the store; an EMPTY value still defaults to agent/memory.md for
+	// the REPL. Workflows never set harness Config.Memory, so they stay
+	// memory-free. The remember tool is registered at the Registry's
+	// zero-value PolicyAllow; any explicit tool-permissions entry for
+	// "remember" still wins, because ApplyPolicies is keyed by name.
+	memFile := conf.MemoryFile
+	if memFile == "" {
+		memFile = "agent/memory.md"
+	}
+	cfg.Memory = &harness.Memory{Path: memFile}
+
 	h := harness.New(cfg, client, registry)
+	registry.Register(harness.RememberTool{H: h})
+
+	// The REPL's stdin scanner, created before h.Confirm below so the
+	// confirmation prompt can share it (Confirm and the prompt loop
+	// never read concurrently: Confirm only runs from inside h.Ask,
+	// which runs inside the loop body).
+	scanner := bufio.NewScanner(os.Stdin)
+	if err := scanner.Err(); err != nil {
+		panic(err)
+	}
+
+	// Confirm gates PolicyAsk tools in the terminal (roadmap 1.2). It
+	// reads from the same stdin scanner as the REPL loop. EOF = decline.
+	h.Confirm = func(call harness.ToolCall) bool {
+		fmt.Printf("\n[confirm] run tool %q with args: %s\n[y/N] ", call.Function.Name, call.Function.Arguments)
+		if !scanner.Scan() {
+			return false
+		}
+		answer := strings.ToLower(strings.TrimSpace(scanner.Text()))
+		return answer == "y" || answer == "yes"
+	}
 
 	// With --stream-thinking, print deltas live: thinking traces on
 	// their own "[thinking] "-prefixed lines, content as it arrives.
@@ -139,12 +220,7 @@ func main() {
 	}
 
 	fmt.Printf("ai-harness ready - model %q at %s. Type 'exit' to quit.\n", cfg.Model, cfg.BaseURL)
-
-	scanner := bufio.NewScanner(os.Stdin)
-	if err := scanner.Err(); err != nil {
-		panic(err)
-	}
-	ctx := context.Background()
+	fmt.Printf("Persistent memory: %s\n", memFile)
 
 	for {
 		fmt.Print("\n> ")
@@ -163,6 +239,17 @@ func main() {
 		// Automatically picks up edits or newly created scripts before every prompt
 		if conf.HotReload {
 			reloadLuaTools(customToolsDir, registry)
+			// viper's OnConfigChange repopulates conf in place, so
+			// re-applying here makes tool-permissions edits live too.
+			applyToolPolicies(conf, registry)
+		}
+
+		// Slash commands (roadmap 1.3): any line starting with '/' is
+		// handled locally and never reaches the model. Handled after the
+		// hot-reload block so /tools reflects freshly reloaded
+		// tools/policies, and before the image-token extraction below.
+		if handleCommand(input, h, &cfg, registry) {
+			continue
 		}
 
 		// Tokens that start with '@' (e.g. @C:\pics\cat.png or @./img/shot.jpg)
@@ -171,14 +258,26 @@ func main() {
 		// to stderr while continuing the prompt.
 		cleanedInput, imagePaths := extractImageTokens(input)
 
+		// Ctrl+C cancellation (roadmap 3.3): the turn runs under a
+		// context that SIGINT cancels, so an interrupt aborts the
+		// in-flight model/tool HTTP requests instead of killing the
+		// process, and askLoop rolls History back to its pre-Ask
+		// state - the session stays usable at the next prompt.
 		var reply string
-		if len(imagePaths) > 0 {
-			reply, err = h.AskWithImages(ctx, cleanedInput, imagePaths)
-		} else {
-			reply, err = h.Ask(ctx, cleanedInput)
+		interrupted, askErr := runWithInterrupt(func(ctx context.Context) error {
+			var aerr error
+			if len(imagePaths) > 0 {
+				reply, aerr = h.AskWithImages(ctx, cleanedInput, imagePaths)
+			} else {
+				reply, aerr = h.Ask(ctx, cleanedInput)
+			}
+			return aerr
+		})
+		if interrupted {
+			continue
 		}
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		if askErr != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", askErr)
 			continue
 		}
 		if streamedContent {
@@ -234,6 +333,199 @@ func extractImageTokens(input string) (string, []string) {
 	return strings.Join(kept, " "), imagePaths
 }
 
+// handleCommand implements the REPL slash commands (roadmap 1.3, plus
+// /compact from 1.1 and /memory from 2.4): /help (and bare /), /reset,
+// /save, /load, /history, /tools, /model, /compact and /memory. Any line starting with '/' is consumed
+// here - unknown commands print "unknown command: /foo" plus a one-line
+// usage list - and the return value reports whether the input WAS a
+// command (true means: do not send it to the model). No slash command
+// reads stdin, so this never races with the h.Confirm prompt that shares
+// the REPL scanner. /compact's summary request is the one command that
+// talks to the server, so it runs under runWithInterrupt (roadmap 3.3):
+// Ctrl+C cancels it mid-request and History stays untouched (Compact
+// only rewrites it after the summary call fully succeeds).
+//
+// /model sets h.Config.Model, which is the field askLoop reads on every
+// request; cfg (main's pre-New copy, only used for startup) is kept in
+// sync so it never goes stale.
+func handleCommand(input string, h *harness.Harness, cfg *harness.Config, registry *harness.Registry) bool {
+	if !strings.HasPrefix(input, "/") {
+		return false
+	}
+
+	fields := strings.Fields(input)
+	name, arg := fields[0], strings.TrimSpace(input[len(fields[0]):])
+
+	switch strings.ToLower(name) {
+	case "/", "/help":
+		printCommands()
+	case "/reset":
+		h.Reset()
+		fmt.Println("started a new conversation (config and tools kept)")
+	case "/save":
+		if arg == "" {
+			fmt.Println("usage: /save <file>")
+			return true
+		}
+		if err := h.SaveSession(arg); err != nil {
+			fmt.Fprintf(os.Stderr, "save failed: %v\n", err)
+			return true
+		}
+		fmt.Printf("saved %d messages to %s\n", len(h.History), arg)
+	case "/load":
+		if arg == "" {
+			fmt.Println("usage: /load <file>")
+			return true
+		}
+		if err := h.LoadSession(arg); err != nil {
+			fmt.Fprintf(os.Stderr, "load failed: %v\n", err)
+			return true
+		}
+		fmt.Printf("loaded %d messages (model %s)\n", len(h.History), h.Config.Model)
+	case "/history":
+		for i, m := range h.History {
+			line := fmt.Sprintf("%3d  %-9s %s", i, m.Role, previewText(harness.ExtractText(m.Content), 120))
+			if n := len(m.ToolCalls); n > 0 {
+				line += fmt.Sprintf(" [+%d tool calls]", n)
+			}
+			if n := len(m.Images); n > 0 {
+				line += fmt.Sprintf(" [+%d images]", n)
+			}
+			fmt.Println(line)
+		}
+	case "/tools":
+		for _, p := range registry.Policies() {
+			fmt.Printf("%s  [%s]\n", p.Name, policyName(p.Policy))
+		}
+	case "/model":
+		if arg == "" {
+			fmt.Printf("current model: %s\n", h.Config.Model)
+			return true
+		}
+		cfg.Model = arg
+		h.Config.Model = arg
+		fmt.Printf("model set to %s\n", arg)
+	case "/memory":
+		// Persistent memory (roadmap 2.4): path, entry count, and the
+		// most recent entries (newest last). Read errors are reported,
+		// not fatal.
+		if h.Memory == nil {
+			fmt.Println("memory is disabled (set memory-file in config.yaml)")
+			return true
+		}
+		entries, err := h.Memory.Load()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "memory read failed: %v\n", err)
+			return true
+		}
+		fmt.Printf("memory file: %s (%d entries)\n", h.Memory.Path, len(entries))
+		const show = 10
+		if len(entries) > show {
+			fmt.Printf("... (%d older entries omitted)\n", len(entries)-show)
+			entries = entries[len(entries)-show:]
+		}
+		for _, e := range entries {
+			fmt.Println(e)
+		}
+	case "/compact":
+		// Manual compaction (roadmap 1.1): summarizes the older History
+		// into one system message. Compact ignores Config.CompactThreshold,
+		// so this works even when the automatic trigger is disabled; a
+		// failed or interrupted summary leaves History untouched (the
+		// summary call only rewrites History after it fully succeeds).
+		before := len(h.History)
+		var changed bool
+		interrupted, err := runWithInterrupt(func(ctx context.Context) error {
+			var cerr error
+			changed, cerr = h.Compact(ctx)
+			return cerr
+		})
+		if interrupted {
+			return true
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "compact failed: %v\n", err)
+			return true
+		}
+		if !changed {
+			fmt.Println("nothing to compact")
+			return true
+		}
+		fmt.Printf("compacted history: %d -> %d messages\n", before, len(h.History))
+	default:
+		fmt.Printf("unknown command: %s\n", name)
+		printCommandUsage()
+	}
+	return true
+}
+
+// runWithInterrupt (roadmap 3.3) runs fn under a context that Ctrl+C
+// (os.Interrupt) cancels instead of killing the process: the in-flight
+// model/tool HTTP requests abort, fn's error wraps context.Canceled,
+// and interrupted reports true after printing the notice, so the REPL
+// re-prompts with the session intact.
+//
+// Signal handling is installed for fn's duration only: Ctrl+C at an
+// idle prompt keeps the original behavior (default handling exits the
+// process). A second Ctrl+C during a turn force-quits, because
+// signal.NotifyContext restores the default handler once it fires.
+//
+// Ctrl+C while a PolicyAsk confirmation is waiting on stdin lands as
+// a cancelled turn: the prompt still consumes the typed line, then
+// askLoop cancels the remaining calls and rolls History back.
+func runWithInterrupt(fn func(ctx context.Context) error) (interrupted bool, err error) {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	err = fn(ctx)
+	if err != nil && ctx.Err() != nil && errors.Is(err, context.Canceled) {
+		fmt.Println("[interrupted - session preserved]")
+		return true, nil
+	}
+	return false, err
+}
+
+// printCommandUsage is the one-line command summary printed after an
+// unknown slash command; printCommands is the /help list with
+// per-command descriptions.
+func printCommandUsage() {
+	fmt.Println("commands: /help  /reset  /save <file>  /load <file>  /history  /tools  /model [name]  /compact  /memory")
+}
+
+func printCommands() {
+	fmt.Println("  /help or /      show this help")
+	fmt.Println("  /reset          start a new conversation (keeps config and tools)")
+	fmt.Println("  /save <file>    save the conversation as JSON (atomic write)")
+	fmt.Println("  /load <file>    load a saved conversation (also restores its model)")
+	fmt.Println("  /history        list messages with truncated one-line previews")
+	fmt.Println("  /tools          list registered tools with their permission policy")
+	fmt.Println("  /model <name>   switch the model live (bare /model prints the current one)")
+	fmt.Println("  /compact        summarize the oldest history into one system message")
+	fmt.Println("  /memory         show the persistent memory file, entry count, and recent entries")
+	fmt.Println("  Ctrl+C          cancel an in-flight request (session preserved); press again to force-quit")
+}
+
+// policyName renders a Registry permission policy for /tools output.
+func policyName(p harness.Policy) string {
+	switch p {
+	case harness.PolicyAsk:
+		return "ask"
+	case harness.PolicyDeny:
+		return "deny"
+	default:
+		return "allow"
+	}
+}
+
+// previewText flattens newlines (a /history line must never contain raw
+// line breaks) and truncates to max runes with an ellipsis.
+func previewText(s string, max int) string {
+	s = strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ").Replace(s)
+	if r := []rune(s); len(r) > max {
+		return string(r[:max]) + "..."
+	}
+	return s
+}
+
 // runWorkflow loads a workflow directory and executes it against the
 // selected base config preset. args become harness.args for main.lua
 // workflows (everything after the workflow directory on the command line).
@@ -262,6 +554,26 @@ func runWorkflow(dir, basePreset string, streamThinking bool, args []string) err
 	defer runner.Close()
 
 	return runner.Run(context.Background(), args)
+}
+
+// applyToolPolicies pushes config.yaml's tool-permissions lists onto
+// the registry (roadmap 1.2), with run_shell_command defaulting to ask
+// unless config explicitly lists it under allow or deny. ApplyPolicies
+// replaces the whole mapping, so names removed from config revert to
+// allow on the next reload.
+func applyToolPolicies(conf *config.Config, registry *harness.Registry) {
+	allow, ask, deny := conf.ToolPermissions.Allow, conf.ToolPermissions.Ask, conf.ToolPermissions.Deny
+	explicit := false
+	for _, n := range append(append([]string{}, allow...), deny...) {
+		if n == "run_shell_command" {
+			explicit = true
+			break
+		}
+	}
+	if !explicit {
+		ask = append(ask, "run_shell_command")
+	}
+	registry.ApplyPolicies(allow, ask, deny)
 }
 
 var luaModTimes = make(map[string]time.Time)

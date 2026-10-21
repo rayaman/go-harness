@@ -72,6 +72,8 @@ steps:
     post_script: scripts/post.lua   # runs after; may rewrite `result`
     save_as: summary                # extra alias in steps.*
     on_error: stop                  # stop (default) | skip
+    # schema: {type: object, required: [title], properties: {...}}  # inline JSON Schema
+    # schema_file: schemas/summary.json                              # ...or a JSON file in this dir
 
   - name: report
     prompt_file: prompts/report.txt # may reference {{steps.summarize}}
@@ -86,7 +88,23 @@ pass before being sent:
 
 - `{{var_name}}` / `{{vars.var_name}}` → workflow `vars`
 - `{{step_name}}` / `{{steps.step_name}}` → output of an earlier step
+- `{{steps.step_name.field.path}}` (and bare `{{name.field.path}}`) →
+  dotted field path inside a schema step's decoded JSON (see Structured output)
 - unknown placeholders are left as-is (literal braces are safe)
+
+### Structured output
+
+A step may declare `schema:` (inline JSON Schema) or `schema_file:` (a JSON
+file in the workflow dir) — not both. Supported subset: `type` (string or
+array of `object`/`array`/`string`/`number`/`integer`/`boolean`),
+`properties`, `required`, `items`, `enum`, and `additionalProperties: false`;
+other keywords are ignored. The runner appends "respond with ONLY valid
+JSON matching this schema" to the prompt, then parses and validates the
+reply (markdown fences are stripped). On parse or validation failure it
+re-asks once with the problems listed; a second failure errors the step
+(`on_error: stop|skip` applies). `{{steps.name}}` still yields the raw JSON
+text, `{{steps.name.field}}` a decoded field, and Lua `harness.step_json(name)`
+returns the decoded value as a table (nil for no-schema steps).
 
 ### Execution model
 
@@ -117,7 +135,8 @@ the workflow's `work_dir`). Both are reached with
 | `harness.context_length(model?)` | `tokens, err` |
 | `harness.set_system_prompt(s)` | resets conversation to new persona |
 | `harness.set_model(m)` | changes the default model |
-| `harness.step_results()` | `{name = output, ...}` |
+| `harness.step_results()` | `{name = output, ...}` (raw text) |
+| `harness.step_json(name)` | decoded JSON table for a schema step, `nil` if none |
 | `harness.vars` / `harness.args` | workflow vars / CLI args after `--` |
 | `harness.log(...)` | stdout |
 | `harness.external.abspath(p)` | absolute path, err (relative to CWD) |
@@ -152,7 +171,9 @@ tool contract (`name()`, `description()`, `parameters()`, `execute(args)`)
 — see [docs/custom_tools.md](custom_tools.md). Builtin Go tools are
 selected by name in `tools.builtin`; available names: `current_time`,
 `read_file`, `list_files`, `read_file_partial`, `get_file_size`,
-`edit_file`, `write_file`.
+`edit_file`, `write_file`, `web_fetch` (GET a page over http/https, HTML
+converted to text; local/private addresses refused), `web_search`
+(numbered web search results via a pluggable backend, DuckDuckGo by default).
 
 ## Sample: manga-translator
 

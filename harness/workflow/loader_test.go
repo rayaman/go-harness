@@ -239,6 +239,110 @@ func TestLoadValidationErrors(t *testing.T) {
 	}
 }
 
+func TestLoadStepSchemas(t *testing.T) {
+	t.Run("inline schema parses to map[string]any with nested converted", func(t *testing.T) {
+		wf, err := Load(writeWorkflow(t, `
+name: sch
+steps:
+  - name: a
+    prompt: x
+    schema:
+      type: object
+      required: [title]
+      properties:
+        title:
+          type: string
+        meta:
+          type: object
+          enum: [1, "two", true]
+`))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		s := wf.Steps[0].Schema
+		if s == nil {
+			t.Fatal("schema not parsed")
+		}
+		if s["type"] != "object" {
+			t.Errorf("type: got %#v", s["type"])
+		}
+		if req, ok := s["required"].([]any); !ok || len(req) != 1 || req[0] != "title" {
+			t.Errorf("required: got %#v", s["required"])
+		}
+		props, ok := s["properties"].(map[string]any)
+		if !ok {
+			t.Fatalf("properties not map[string]any: %#v", s["properties"])
+		}
+		title, ok := props["title"].(map[string]any)
+		if !ok || title["type"] != "string" {
+			t.Errorf("nested properties.title: %#v", props["title"])
+		}
+		meta, ok := props["meta"].(map[string]any)
+		if !ok {
+			t.Fatalf("nested properties.meta not map[string]any: %#v", props["meta"])
+		}
+		if e, ok := meta["enum"].([]any); !ok || len(e) != 3 {
+			t.Errorf("nested enum: %#v", meta["enum"])
+		}
+	})
+
+	t.Run("schema_file loads JSON from the workflow dir", func(t *testing.T) {
+		dir := writeWorkflow(t, `
+name: schfile
+steps:
+  - name: a
+    prompt: x
+    schema_file: schemas/a.json
+`)
+		if err := os.MkdirAll(filepath.Join(dir, "schemas"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "schemas", "a.json"),
+			[]byte(`{"type":"object","required":["title"],"properties":{"title":{"type":"string"}}}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		wf, err := Load(dir)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		s := wf.Steps[0].Schema
+		if s["type"] != "object" {
+			t.Errorf("schema_file type: %#v", s)
+		}
+		if req, ok := s["required"].([]any); !ok || req[0] != "title" {
+			t.Errorf("schema_file required: %#v", s["required"])
+		}
+	})
+
+	errCases := map[string]string{
+		"both schema and schema_file": "name: x\nsteps:\n  - name: a\n    prompt: 1\n    schema:\n      type: object\n    schema_file: s.json\n",
+		"missing schema_file":         "name: x\nsteps:\n  - name: a\n    prompt: 1\n    schema_file: nope.json\n",
+		"bad json schema_file":        "name: x\nsteps:\n  - name: a\n    prompt: 1\n    schema_file: bad.json\n",
+		"empty inline schema (null)":  "name: x\nsteps:\n  - name: a\n    prompt: 1\n    schema:\n",
+		"empty inline schema (brace)": "name: x\nsteps:\n  - name: a\n    prompt: 1\n    schema: {}\n",
+	}
+	for label, body := range errCases {
+		t.Run(label, func(t *testing.T) {
+			dir := writeWorkflow(t, body)
+			if label == "bad json schema_file" {
+				if err := os.WriteFile(filepath.Join(dir, "bad.json"), []byte("{not json"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, err := Load(dir)
+			if err == nil {
+				t.Fatalf("expected load error for %s", label)
+			}
+			if label == "both schema and schema_file" && !strings.Contains(err.Error(), `step "a": set only one of schema / schema_file`) {
+				t.Errorf("both-set error should name the step and keys, got: %v", err)
+			}
+			if label == "missing schema_file" && !(strings.Contains(err.Error(), `step "a"`) && strings.Contains(err.Error(), "nope.json")) {
+				t.Errorf("missing-file error should name step and file, got: %v", err)
+			}
+		})
+	}
+}
+
 func TestResolvePathTraversal(t *testing.T) {
 	wf, err := Load(writeWorkflow(t, "name: x\nsteps:\n  - name: a\n    prompt: 1\n"))
 	if err != nil {

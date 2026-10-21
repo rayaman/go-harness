@@ -15,6 +15,11 @@ type WriteFileTool struct {
 
 func (t WriteFileTool) Name() string { return "write_file" }
 
+// Serial reports true: writing files has side effects, so this tool never
+// runs concurrently with other tool calls in a turn (harness.SerialTyper,
+// roadmap 2.1).
+func (t WriteFileTool) Serial() bool { return true }
+
 func (t WriteFileTool) Description() string {
 	return fmt.Sprintf("Create a new file or completely overwrite an existing file. Paths are relative to %s.", t.BaseDir)
 }

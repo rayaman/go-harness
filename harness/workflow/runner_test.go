@@ -447,3 +447,187 @@ func mustRunner(t *testing.T, wf *Workflow, f *fakeServer, out io.Writer) (*Runn
 	t.Cleanup(r.Close)
 	return r, nil
 }
+
+// -----------------------------------------------------------------------------
+// Structured output (roadmap 2.5)
+// -----------------------------------------------------------------------------
+
+// lastUserContent returns the content of the last message in request i of
+// the fake server, as a string (suitable for substring assertions).
+func lastUserContent(f *fakeServer, i int) string {
+	msgs, _ := f.requests[i]["messages"].([]any)
+	last, _ := msgs[len(msgs)-1].(map[string]any)
+	s, _ := last["content"].(string)
+	return s
+}
+
+func TestStepSchemaSuccess(t *testing.T) {
+	f := newFakeServer(t, `{"title": "Hello"}`, "done")
+	wf, err := Load(writeWorkflow(t, `
+name: structok
+steps:
+  - name: s1
+    prompt: Extract
+    save_as: extr
+    schema:
+      type: object
+      required: [title]
+      properties:
+        title:
+          type: string
+  - name: s2
+    prompt: "title is {{steps.s1.title}}"
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	var out bytes.Buffer
+	r, _ := mustRunner(t, wf, f, &out)
+	if err := r.Run(context.Background(), nil); err != nil {
+		t.Fatalf("Run: %v\noutput: %s", err, out.String())
+	}
+	if len(f.requests) != 2 {
+		t.Fatalf("expected 2 chat requests, got %d", len(f.requests))
+	}
+	// First prompt must carry the schema instructions suffix.
+	if !strings.Contains(lastUserContent(f, 0), "Respond with ONLY a single valid JSON value") {
+		t.Errorf("schema instructions missing from step prompt: %s", lastUserContent(f, 0))
+	}
+	// Raw text recorded as today, decoded value recorded alongside (plus
+	// the save_as alias).
+	if r.stepOutputs["s1"] != `{"title": "Hello"}` {
+		t.Errorf("raw step output: %q", r.stepOutputs["s1"])
+	}
+	decoded, ok := r.stepJSON["s1"].(map[string]any)
+	if !ok || decoded["title"] != "Hello" {
+		t.Errorf("decoded step JSON: %#v", r.stepJSON["s1"])
+	}
+	if d2, ok := r.stepJSON["extr"].(map[string]any); !ok || d2["title"] != "Hello" {
+		t.Errorf("save_as alias decoded JSON: %#v", r.stepJSON["extr"])
+	}
+	// Later step's server-side prompt resolves the nested field.
+	if !strings.Contains(lastUserContent(f, 1), "title is Hello") {
+		t.Errorf("{{steps.s1.title}} not resolved: %s", lastUserContent(f, 1))
+	}
+}
+
+func TestStepSchemaRetry(t *testing.T) {
+	f := newFakeServer(t, "not json at all", `{"title": "Hello"}`)
+	wf, err := Load(writeWorkflow(t, `
+name: retry
+steps:
+  - name: s1
+    prompt: Extract
+    schema:
+      type: object
+      required: [title]
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	var out bytes.Buffer
+	r, _ := mustRunner(t, wf, f, &out)
+	if err := r.Run(context.Background(), nil); err != nil {
+		t.Fatalf("Run: %v\noutput: %s", err, out.String())
+	}
+	if len(f.requests) != 2 {
+		t.Fatalf("expected exactly 2 model requests for the step, got %d", len(f.requests))
+	}
+	retry := lastUserContent(f, 1)
+	if !strings.Contains(retry, "not valid") {
+		t.Errorf("retry prompt missing \"not valid\": %s", retry)
+	}
+	if !strings.Contains(retry, "Reply again with ONLY the JSON value.") {
+		t.Errorf("retry prompt missing final instruction: %s", retry)
+	}
+	// First reply isn't JSON at all, so the problem text reports the parse failure.
+	if !strings.Contains(retry, "reply was not valid JSON") {
+		t.Errorf("retry prompt missing parse problem text: %s", retry)
+	}
+	if r.stepOutputs["s1"] != `{"title": "Hello"}` {
+		t.Errorf("step output after retry: %q", r.stepOutputs["s1"])
+	}
+}
+
+func TestStepSchemaFailsAfterRetry(t *testing.T) {
+	f := newFakeServer(t, "not json", "also not json", "OK")
+	wf, err := Load(writeWorkflow(t, `
+name: structfail
+steps:
+  - name: s1
+    prompt: Extract
+    on_error: skip
+    schema:
+      type: object
+      required: [title]
+  - name: s2
+    prompt: continue
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	var out bytes.Buffer
+	r, _ := mustRunner(t, wf, f, &out)
+	// on_error: skip -> the run keeps going past the failing step.
+	if err := r.Run(context.Background(), nil); err != nil {
+		t.Fatalf("on_error: skip should not fail the run: %v", err)
+	}
+	if len(f.requests) != 3 {
+		t.Fatalf("expected 2 failed requests + 1 for step two, got %d", len(f.requests))
+	}
+	if !strings.Contains(out.String(), "reply failed schema validation after one retry") {
+		t.Errorf("skip message missing validation error: %s", out.String())
+	}
+	if _, ok := r.stepOutputs["s1"]; ok {
+		t.Error("failed step should record no output")
+	}
+	if _, ok := r.stepJSON["s1"]; ok {
+		t.Error("failed step should record no decoded value")
+	}
+	if r.stepOutputs["s2"] != "OK" {
+		t.Errorf("workflow did not continue after skipped schema failure: %v", r.stepOutputs)
+	}
+}
+
+func TestStepJSONFieldTemplating(t *testing.T) {
+	f := newFakeServer(t, `{"a": {"b": 42}, "meta": {"x": 1, "y": "z"}}`)
+	wf, err := Load(writeWorkflow(t, `
+name: tmpl
+steps:
+  - name: s
+    prompt: Extract
+    schema:
+      type: object
+      properties:
+        a:
+          type: object
+          properties:
+            b:
+              type: integer
+        meta:
+          type: object
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	var out bytes.Buffer
+	r, _ := mustRunner(t, wf, f, &out)
+	if err := r.Run(context.Background(), nil); err != nil {
+		t.Fatalf("Run: %v\noutput: %s", err, out.String())
+	}
+
+	got := r.render("{{steps.s.a.b}}|{{s.a.b}}|{{steps.s.meta}}|{{steps.s}}|{{steps.s.a.nope}}|{{steps.s.bogus.deep}}")
+	want := `42|42|{"x":1,"y":"z"}|{"a": {"b": 42}, "meta": {"x": 1, "y": "z"}}|{{steps.s.a.nope}}|{{steps.s.bogus.deep}}`
+	if got != want {
+		t.Errorf("render:\n got %q\nwant %q", got, want)
+	}
+
+	// Scalar rendering helper: integral float64 prints plain (42, not
+	// 4.2e+01), non-integral keeps shortest form.
+	if renderJSONValue(42.0) != "42" {
+		t.Errorf("renderJSONValue(42.0) = %q", renderJSONValue(42.0))
+	}
+	if renderJSONValue(4.25) != "4.25" {
+		t.Errorf("renderJSONValue(4.25) = %q", renderJSONValue(4.25))
+	}
+}

@@ -19,6 +19,7 @@
 package workflow
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -47,6 +48,7 @@ type Workflow struct {
 	Vars        map[string]string `yaml:"vars"`
 	Config      ConfigOverrides   `yaml:"config"`
 	Tools       ToolsSpec         `yaml:"tools"`
+	Permissions PermissionsSpec   `yaml:"permissions"`
 	Steps       []Step            `yaml:"steps"`
 
 	// Dir is the absolute path of the workflow directory. All relative
@@ -93,6 +95,15 @@ type ToolsSpec struct {
 	LuaDir string `yaml:"lua_dir"`
 }
 
+// PermissionsSpec is the optional top-level `permissions:` block of
+// workflow.yaml (roadmap 1.2).
+type PermissionsSpec struct {
+	// Ask makes the runner prompt on its output writer (reading stdin)
+	// before running any tool whose policy is ask. Default false =
+	// auto-allow, i.e. today's non-interactive behavior.
+	Ask bool `yaml:"ask"`
+}
+
 // Step is one unit of work in the declarative steps loop.
 type Step struct {
 	Name string `yaml:"name"` // unique; result recorded as steps.<name>
@@ -116,6 +127,16 @@ type Step struct {
 
 	SaveAs  string `yaml:"save_as"`  // alias for this step's output in steps.*
 	OnError string `yaml:"on_error"` // "stop" (default) | "skip"
+
+	// Schema (roadmap 2.5) is an inline JSON Schema (supported subset
+	// documented in schema.go) the step's reply must match; SchemaFile
+	// names a JSON file (relative to the workflow dir) holding the same.
+	// Both optional; setting both is a load error. When set, the runner
+	// appends schema instructions to the prompt, parses/validates the
+	// reply (one retry on failure), and records the decoded value for
+	// {{steps.name.field}} templating and harness.step_json().
+	Schema     map[string]any `yaml:"schema"`
+	SchemaFile string         `yaml:"schema_file"`
 }
 
 // ToolSelector accepts either a bare string ("all" / "none") or a list of
@@ -199,7 +220,71 @@ func Load(dir string) (*Workflow, error) {
 	if err := wf.validate(); err != nil {
 		return nil, fmt.Errorf("invalid workflow %q: %w", wf.Name, err)
 	}
+	if err := wf.loadSchemas(data); err != nil {
+		return nil, fmt.Errorf("invalid workflow %q: %w", wf.Name, err)
+	}
 	return wf, nil
+}
+
+// loadSchemas resolves each step's optional schema / schema_file keys
+// (roadmap 2.5): inline schemas are normalized to the json-shaped
+// map[string]any / []any the validator expects (yaml.v3 already yields
+// those for string-keyed mappings; map[any]any fallbacks are converted
+// recursively), and schema_file is read from the workflow dir and
+// unmarshaled as JSON. A schema that ends up empty - `schema:` with
+// nothing under it, `schema: {}`, or an empty JSON object - is a typo
+// and fails the load.
+func (wf *Workflow) loadSchemas(manifest []byte) error {
+	// `schema:` with a null value decodes to a nil map, indistinguishable
+	// from "key absent" at the struct level, so consult the raw document
+	// to catch that typo too.
+	var raw map[string]any
+	var rawSteps []any
+	if yaml.Unmarshal(manifest, &raw) == nil {
+		rawSteps, _ = raw["steps"].([]any)
+	}
+
+	for i := range wf.Steps {
+		st := &wf.Steps[i]
+		inlineSet := st.Schema != nil
+		if i < len(rawSteps) {
+			if m, ok := rawSteps[i].(map[string]any); ok {
+				if v, present := m["schema"]; present && v == nil {
+					inlineSet = true
+				}
+			}
+		}
+		if !inlineSet && st.SchemaFile == "" {
+			continue
+		}
+		if inlineSet && st.SchemaFile != "" {
+			return fmt.Errorf("step %q: set only one of schema / schema_file", st.Name)
+		}
+		if st.SchemaFile != "" {
+			full, err := wf.ResolvePath(st.SchemaFile)
+			if err != nil {
+				return fmt.Errorf("step %q: schema_file %q: %w", st.Name, st.SchemaFile, err)
+			}
+			b, err := os.ReadFile(full)
+			if err != nil {
+				return fmt.Errorf("step %q: schema_file %q: %w", st.Name, st.SchemaFile, err)
+			}
+			var m map[string]any
+			if err := json.Unmarshal(b, &m); err != nil {
+				return fmt.Errorf("step %q: schema_file %q: %w", st.Name, st.SchemaFile, err)
+			}
+			st.Schema = m
+		} else {
+			// A null `schema:` normalizes to nil and lands in the
+			// empty-schema error below.
+			m, _ := normalizeSchema(st.Schema).(map[string]any)
+			st.Schema = m
+		}
+		if len(st.Schema) == 0 {
+			return fmt.Errorf("step %q: schema is empty: add keyword(s) or remove the key", st.Name)
+		}
+	}
+	return nil
 }
 
 func (wf *Workflow) validate() error {

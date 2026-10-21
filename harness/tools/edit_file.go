@@ -15,6 +15,12 @@ type EditFileTool struct {
 
 func (t EditFileTool) Name() string { return "edit_file" }
 
+// Serial reports true: editing files has side effects (and a concurrent
+// read-modify-write could clobber another edit), so this tool never runs
+// concurrently with other tool calls in a turn (harness.SerialTyper,
+// roadmap 2.1).
+func (t EditFileTool) Serial() bool { return true }
+
 func (t EditFileTool) Description() string {
 	return fmt.Sprintf("Edit an existing file by replacing exact target text (old_str) with new text (new_str). Paths are relative to %s.", t.BaseDir)
 }

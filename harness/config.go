@@ -1,6 +1,10 @@
 package harness
 
-import "time"
+import (
+	"fmt"
+	"os"
+	"time"
+)
 
 // Config holds everything needed to point the harness at a local model
 // server and control how the agent loop behaves. This is the first place
@@ -53,6 +57,24 @@ type Config struct {
 	// looping on tool calls forever without ever giving a final answer.
 	MaxToolIterations int
 
+	// MaxToolOutputBytes caps the size of a successful tool result before
+	// it is fed back to the model (see Harness.runTool): an oversized
+	// result is cut to a head and a tail with a "[truncated N of M bytes]"
+	// marker in between. Zero (the default) means unlimited, so existing
+	// behavior is unchanged unless this is set. Individual tools may
+	// override this by implementing the MaxOutputTyper interface.
+	MaxToolOutputBytes int
+
+	// MaxParallelTools caps how many concurrency-safe tool calls from a
+	// single assistant turn execute at the same time (roadmap 2.1, see
+	// Harness.runToolCalls). Zero or negative (the zero value) falls back
+	// to the package default (see defaultMaxParallelTools in
+	// harness/harness.go: 4). Tools marked serial - those implementing
+	// harness.SerialTyper with Serial() == true, and any PolicyAsk tool
+	// that isn't marked serial - always run one at a time regardless of
+	// this value.
+	MaxParallelTools int
+
 	// MaxContextTokens is the model's context window size, in tokens.
 	// This is informational by default (the harness uses it to warn when
 	// a conversation is getting close to the limit) - see Harness.Ask.
@@ -76,6 +98,16 @@ type Config struct {
 	// config.request_timeout (a Go duration string like "10m" or "300s").
 	RequestTimeout time.Duration
 
+	// MaxRetries is the number of EXTRA attempts the chat-completion
+	// calls make after a retryable failure (transport errors, HTTP
+	// 408/429/5xx): N retries means at most N+1 tries, with exponential
+	// backoff (1s, 2s, 4s; see harness/client.go). Zero (the zero value)
+	// disables retrying entirely, preserving the original single-attempt
+	// behavior; negative also means disabled. Embedders that build a
+	// Config by hand therefore keep today's exact behavior; the presets
+	// below opt in with MaxRetries: 2.
+	MaxRetries int
+
 	// MaxImageDimension is the longest-side pixel cap applied to images
 	// attached to chat requests (see utils.LoadImage). Images whose width
 	// or height exceed it are downscaled proportionally so the longest
@@ -93,6 +125,45 @@ type Config struct {
 	// original request/response shape byte-for-byte. The REPL sets it via
 	// --stream-thinking; workflows via config.stream_thinking.
 	StreamThinking bool
+
+	// CompactThreshold is the fraction of MaxContextTokens at which the
+	// oldest History messages get summarized into a single system message
+	// before the next request (see Harness.Compact, roadmap 1.1). The
+	// auto-trigger in askLoop fires when LastUsage.PromptTokens reaches
+	// MaxContextTokens*CompactThreshold, so BOTH this value and
+	// MaxContextTokens must be positive for compaction to auto-fire.
+	// Zero or negative (the zero value) disables compaction entirely,
+	// keeping existing behavior byte-for-byte for embedders that build a
+	// Config by hand; the presets below opt in with 0.8. Harness.Compact
+	// itself (the manual /compact path) ignores this field.
+	CompactThreshold float64
+
+	// CompactKeepTurns is the number of most-recent MESSAGES (not turn
+	// pairs) of History kept verbatim when compaction runs; everything
+	// older than that window is summarized. Zero or negative falls back
+	// to the package default (see defaultCompactKeepTurns in
+	// harness/compact.go). The split point never cuts an assistant
+	// tool_calls message away from its tool results.
+	CompactKeepTurns int
+
+	// Memory attaches a persistent cross-session note store to the
+	// Harness (roadmap 2.4, see harness/memory.go): its entries are
+	// injected into the leading system message at New/Reset/LoadSession
+	// and the remember tool appends to them. Nil (the zero value)
+	// disables memory entirely, so embedders and workflows that build a
+	// Config by hand stay byte-for-byte unchanged.
+	Memory *Memory
+
+	// LogDir enables the JSONL transcript logger (roadmap 3.1, see
+	// harness/logging.go): each Harness gets a per-session file
+	// transcript-<unixnano>.jsonl in this directory, with one line per
+	// chat request, assistant response (with usage when reported) and
+	// tool call execution. The directory is created if missing. Empty
+	// (the zero value) disables logging entirely, so embedders and
+	// workflows that build a Config by hand stay byte-for-byte
+	// unchanged. The REPL copies it from the config.yaml key
+	// `log-dir` (see harness/config).
+	LogDir string
 }
 
 // DefaultConfig returns sane defaults for a typical local Ollama setup.
@@ -103,6 +174,8 @@ func DefaultConfig() Config {
 		Provider:          "openai",
 		MaxToolIterations: 100,
 		MaxContextTokens:  32768,
+		MaxRetries:        2,
+		CompactThreshold:  0.8,
 		BaseURL:           "http://192.168.1.235:8810/v1",
 		Model:             "qwen3-coder-next-gguf",
 		SystemPrompt:      "You are a helpful assistant running locally on the user's machine. Use tools when they help you answer accurately, and say so plainly when you don't know something.",
@@ -110,11 +183,23 @@ func DefaultConfig() Config {
 	}
 }
 
+// BdoConfig is the preset for the BDO-assistant server. The API key is
+// NOT embedded (roadmap 3.2): it comes from the BDO_API_KEY environment
+// variable. An unset/empty variable is not fatal - the preset still
+// builds and the request simply goes out unauthenticated (fine for
+// servers that ignore auth) - but a stderr warning names the variable
+// so the auth failure is easy to trace.
 func BdoConfig() Config {
+	key := os.Getenv("BDO_API_KEY")
+	if key == "" {
+		fmt.Fprintln(os.Stderr, "warning: BDO_API_KEY is not set; BdoConfig has no API key")
+	}
 	return Config{
 		Provider:          "openai",
 		MaxToolIterations: 50, // might need
-		APIKey:            "sk-unsloth-94d524b13d50f995c58cbb5d08c090c3",
+		MaxRetries:        2,
+		CompactThreshold:  0.8,
+		APIKey:            key,
 		BaseURL:           "http://192.168.1.235:8810/v1",
 		Model:             "Qwen3-4B-Thinking-2507-GGUF",
 		SystemPrompt: `You are a helpful assistant running locally on the user's machine to help them with their mmo rpg game bdo.
@@ -135,8 +220,25 @@ func OllamaConfig() Config {
 		Provider:          "ollama",
 		MaxToolIterations: 100,
 		MaxContextTokens:  32768, // passed as num_ctx to OllamaChat
+		MaxRetries:        2,
+		CompactThreshold:  0.8,
 		BaseURL:           "http://localhost:11434/v1",
 		Model:             "gemma4:31b",
+		SystemPrompt:      "You are a helpful assistant running locally on the user's machine. Use tools when they help you answer accurately, and say so plainly when you don't know something.",
+		Temperature:       0.7,
+	}
+}
+
+func StrataConfig() Config {
+	return Config{
+		Provider:          "openai",
+		MaxToolIterations: 100,
+		MaxContextTokens:  128000, // passed as num_ctx to OllamaChat
+		MaxRetries:        3,
+		CompactThreshold:  0.8,
+		APIKey:            "myapikey",
+		BaseURL:           "http://192.168.1.235:8095/v1",
+		Model:             "qwen3.8-flash-next-iq3_s",
 		SystemPrompt:      "You are a helpful assistant running locally on the user's machine. Use tools when they help you answer accurately, and say so plainly when you don't know something.",
 		Temperature:       0.7,
 	}
