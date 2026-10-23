@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<!-- shell: harness-spa rev1 -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ai-harness</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header id="topbar">
+  <span class="brand">ai-harness</span>
+  <span id="chip-model" class="chip" title="active model / provider"></span>
+  <span id="chip-tools" class="chip" title="tool and MCP server counts"></span>
+  <span id="chip-memory" class="chip" title="persistent memory file"></span>
+  <div id="ctx-meter" class="meter" title="context window usage of the active session">
+    <div class="meter-fill" id="ctx-fill"></div>
+    <span class="meter-label" id="ctx-label"></span>
+  </div>
+  <button id="btn-logout" class="btn ghost">Log out</button>
+</header>
+
+<div id="layout">
+
+  <aside id="sidebar">
+    <div class="side-head">Sessions</div>
+    <ul id="session-list"></ul>
+    <div class="side-actions">
+      <button id="btn-session-new" class="btn small">New</button>
+      <button id="btn-session-rename" class="btn small">Rename</button>
+      <button id="btn-session-delete" class="btn small danger">Delete</button>
+      <button id="btn-session-save" class="btn small">Save</button>
+      <button id="btn-session-load" class="btn small">Load</button>
+    </div>
+  </aside>
+
+  <main id="main">
+    <nav id="tabs">
+      <button class="tab active" data-tab="chat">Chat</button>
+      <button class="tab" data-tab="tools">Tools</button>
+      <button class="tab" data-tab="mcp">MCP</button>
+      <button class="tab" data-tab="memory">Memory</button>
+      <button class="tab" data-tab="logs">Logs</button>
+      <button class="tab" data-tab="settings">Settings</button>
+      <span id="chat-actions">
+        <button id="btn-reset" class="btn small" title="clear this session's conversation (/reset)">Reset</button>
+        <button id="btn-compact" class="btn small" title="summarize older history (/compact)">Compact</button>
+        <button id="btn-chat-save" class="btn small" title="persist to agent/sessions/*.json">Save</button>
+        <button id="btn-chat-load" class="btn small" title="load a saved session file">Load</button>
+      </span>
+    </nav>
+
+    <!-- Chat -->
+    <section id="panel-chat" class="panel active">
+      <div id="transcript" class="scroll-host"></div>
+      <div id="composer">
+        <div id="attach-host"></div>
+        <textarea id="chat-input" rows="3"
+          placeholder="Ask the agent… (Ctrl+Enter to send; @path tokens embed images natively)"></textarea>
+        <div id="composer-btns">
+          <button id="btn-attach" class="btn small" title="upload an image (png/jpg/gif/webp)">Attach image</button>
+          <input type="file" id="file-input" accept=".png,.jpg,.jpeg,.gif,.webp" hidden>
+          <span class="spacer"></span>
+          <button id="btn-stop" class="btn small danger" disabled>Stop</button>
+          <button id="btn-send" class="btn primary">Send</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Tools -->
+    <section id="panel-tools" class="panel">
+      <div class="panel-bar">
+        <span id="tools-count" class="muted"></span>
+        <span class="spacer"></span>
+        <button id="btn-tools-reload" class="btn small" title="re-read config.yaml policies and hot-reload Lua tools">Reload</button>
+      </div>
+      <div class="panel-scroll scroll-host">
+        <table class="grid">
+          <thead><tr><th>Tool</th><th>Policy</th></tr></thead>
+          <tbody id="tools-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- MCP -->
+    <section id="panel-mcp" class="panel">
+      <div class="panel-bar"><span class="muted">Configured MCP servers (live tools/list probe)</span></div>
+      <div class="panel-scroll scroll-host">
+        <div id="mcp-warnings"></div>
+        <table class="grid">
+          <thead><tr><th>Name</th><th>Command</th><th>Status</th><th>Tools</th></tr></thead>
+          <tbody id="mcp-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Memory -->
+    <section id="panel-memory" class="panel">
+      <div class="panel-bar"><span id="memory-file" class="muted mono"></span></div>
+      <div class="panel-scroll scroll-host">
+        <ol id="memory-list"></ol>
+      </div>
+      <div id="memory-add">
+        <textarea id="memory-input" rows="2" placeholder="Add a memory entry…"></textarea>
+        <button id="btn-memory-add" class="btn primary small">Add entry</button>
+      </div>
+    </section>
+
+    <!-- Logs -->
+    <section id="panel-logs" class="panel">
+      <div class="panel-bar">
+        <span id="logs-dir" class="muted mono"></span>
+        <span id="logs-files"></span>
+        <span class="spacer"></span>
+        <button id="btn-logs-refresh" class="btn small">Refresh</button>
+        <button id="btn-log-follow" class="btn small">Follow</button>
+      </div>
+      <div id="logs-disabled" class="notice warn" hidden></div>
+      <div id="log-host" class="panel-scroll scroll-host"></div>
+      <div class="panel-bar">
+        <button id="btn-log-more" class="btn small" hidden>Load more</button>
+      </div>
+    </section>
+
+    <!-- Settings -->
+    <section id="panel-settings" class="panel">
+      <div class="panel-scroll scroll-host">
+        <form id="settings-form" autocomplete="off" onsubmit="return false">
+          <div class="form-grid">
+            <label>Provider
+              <select id="set-provider">
+                <option value="openai">openai</option>
+                <option value="ollama">ollama</option>
+              </select>
+            </label>
+            <label>Base URL <input id="set-base_url" type="text" spellcheck="false"></label>
+            <label>Model <input id="set-model" type="text" spellcheck="false"></label>
+            <label>API key <input id="set-api_key" type="text" spellcheck="false"
+              placeholder="unchanged if left as ****"></label>
+            <label class="wide">System prompt
+              <textarea id="set-system_prompt" rows="4"></textarea>
+            </label>
+            <label>Temperature <input id="set-temperature" type="number" step="0.01" min="0" max="2"></label>
+            <label>Context tokens <input id="set-max_context_tokens" type="number" step="1" min="0"></label>
+            <label>Max tool iterations <input id="set-max_tool_iterations" type="number" step="1" min="0"></label>
+            <label>Max parallel tools <input id="set-max_parallel_tools" type="number" step="1" min="0"></label>
+            <label>Max tool output bytes <input id="set-max_tool_output_bytes" type="number" step="1" min="0"></label>
+            <label>Max retries <input id="set-max_retries" type="number" step="1" min="0"></label>
+            <label>Image max dimension <input id="set-max_image_dimension" type="number" step="1" min="0"></label>
+            <label>Request timeout <input id="set-request_timeout" type="text" spellcheck="false" placeholder="10m"></label>
+            <label class="check"><input id="set-stream_thinking" type="checkbox"> Stream thinking</label>
+            <label>Compact threshold <input id="set-compact_threshold" type="number" step="0.01" min="0" max="1"></label>
+            <label>Compact keep turns <input id="set-compact_keep_turns" type="number" step="1" min="0"></label>
+            <label class="wide">Log directory <input id="set-log_dir" type="text" spellcheck="false"
+              placeholder="empty disables transcript logging"></label>
+          </div>
+          <div class="panel-bar">
+            <button id="btn-settings-save" class="btn primary" type="button">Save</button>
+            <button id="btn-settings-test" class="btn" type="button">Test connection</button>
+            <span id="test-result" class="muted"></span>
+          </div>
+          <p class="muted hint">Numbers left empty mean "use the startup preset". A saved change is pushed
+            live through every session (ReconfigureAll).</p>
+        </form>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<div id="toasts"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

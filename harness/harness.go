@@ -118,6 +118,44 @@ func (h *Harness) Reset() {
 	_ = h.applyMemory()
 }
 
+// Reconfigure swaps the Config and Client of a live Harness while keeping
+// History, LastUsage, Confirm, OnDelta and the transcript logger intact.
+// It is the live provider/model/endpoint switch the web settings UI will
+// need (web/config.go): the conversation survives a settings change
+// without a process restart. The REPL's /model command (main.go) keeps
+// only assigning h.Config.Model because that path never changes the
+// endpoint; Reconfigure is the heavier hand-off that also rebinds the
+// Client and everything New derives from Config.
+//
+// Like New, it pushes cfg.MaxRetries onto the Client (roadmap 1.4); a
+// nil client keeps the existing one, so callers that only change
+// settings can pass nil. The leading system message follows the same
+// invariant Reset and LoadSession maintain (harness/memory.go):
+// systemBase is re-captured from cfg.SystemPrompt and applyMemory
+// rebuilds History[0].Content over that base, so calling Reconfigure
+// repeatedly never stacks memory blocks. History[1:] is never touched.
+// A cfg.Memory of nil only stops future injection - a block already in
+// History[0] stays until the next Reset or a Reconfigure that supplies a
+// store. The transcript logger is per-process (roadmap 3.1), so
+// h.transcript deliberately stays as-is: a new Config.LogDir takes
+// effect on restart, not here.
+func (h *Harness) Reconfigure(cfg Config, client *Client) {
+	if client != nil {
+		h.Client = client
+	}
+	// Same contract as New's client.SetMaxRetries(cfg.MaxRetries); a
+	// hand-built Harness without a Client just skips it.
+	if h.Client != nil {
+		h.Client.SetMaxRetries(cfg.MaxRetries)
+	}
+	h.Config = cfg
+	h.systemBase = cfg.SystemPrompt
+	h.Memory = cfg.Memory
+	// Memory read failures are warning-only inside applyMemory, so a
+	// broken memory file can never fail a live re-configuration.
+	_ = h.applyMemory()
+}
+
 // Ask sends a user message through the full agent loop (including any
 // back-and-forth tool calls) and returns the model's final text reply.
 // This is the main entry point to call for each turn of conversation -

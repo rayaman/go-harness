@@ -8,6 +8,7 @@ import (
 	"ai-harness/harness/mcp"
 	"ai-harness/harness/tools"
 	"ai-harness/harness/workflow"
+	"ai-harness/web"
 	"bufio"
 	"context"
 	"errors"
@@ -29,6 +30,15 @@ func main() {
 	workflowDir := flag.String("workflow", "", "path to a workflow directory to run instead of the REPL")
 	basePreset := flag.String("base-config", "ollama", `base config for workflows: "ollama" or "openai"`)
 	streamThinking := flag.Bool("stream-thinking", false, "stream model thinking/reasoning output live")
+	// Web server flags (web/config.go): --server is the bind address for
+	// the browser UI ("0.0.0.0", "192.168.1.235", ...); an EMPTY value
+	// means web mode is OFF and the REPL runs. --web-user/--web-pass are
+	// the login credentials; the HARNESS_WEB_USER / HARNESS_WEB_PASS env
+	// fallbacks arrive with the auth task.
+	serverAddr := flag.String("server", "", `bind address for the web UI (e.g. "0.0.0.0" or "192.168.1.235"); empty = web mode OFF`)
+	webPort := flag.Int("port", 8080, "web UI port (an explicit --port also enables web mode)")
+	webUser := flag.String("web-user", "", "web UI login username (env fallback HARNESS_WEB_USER comes later)")
+	webPass := flag.String("web-pass", "", "web UI login password (env fallback HARNESS_WEB_PASS comes later)")
 	flag.Parse()
 
 	if *workflowDir != "" {
@@ -40,134 +50,85 @@ func main() {
 	}
 	// ---------------------------------------------------------------------
 
-	cfg := harness.StrataConfig()
-	conf := config.GetConfig()
+	// --- Web mode ------------------------------------------------------
+	// go run main.go --server 0.0.0.0 [--port 8080] serves the browser UI
+	// instead of running the REPL loop below. Web mode is enabled when
+	// --server is non-empty OR --port was explicitly set: flag.Visit only
+	// sees flags that were actually provided, so a bare `--port 9000`
+	// (empty --server, listen on all interfaces) turns web mode on too.
+	portExplicit := false
+	streamThinkingExplicit := false
+	flag.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "port":
+			portExplicit = true
+		case "stream-thinking":
+			streamThinkingExplicit = true
+		}
+	})
+	webMode := *serverAddr != "" || portExplicit
 
-	// --- Edit these to point at a different model/server -------------
-	// cfg.Model = "qwen2.5:14b"
-	// cfg.BaseURL = "http://localhost:8080/v1" // e.g. llama.cpp server
-	// cfg.Temperature = 0.2
-	// -------------------------------------------------------------------
-
-	client := harness.NewClient(cfg.BaseURL, cfg.APIKey)
-
-	// Ask the server for this model's real context window rather than
-	// guessing. This only works against Ollama's native /api/show
-	// endpoint - if it fails (different server, model not pulled yet,
-	// etc.) we just skip the percentage display below.
-	ctxProbe, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	if n, err := client.ContextLength(ctxProbe, cfg.Model); err == nil {
-		cfg.MaxContextTokens = n
+	// Web chat streams by default: the browser UI renders content/thinking
+	// deltas live over SSE, so without streaming the reply lands as a
+	// single content event at turn end and the chat looks frozen.
+	// --stream-thinking=false still opts out (flag.Visit sees an
+	// explicitly-set flag either way); the REPL keeps its historical
+	// opt-in default. Saved web-settings can override afterwards
+	// (WebSettings.StreamThinking is a *bool).
+	agentStreamThinking := *streamThinking
+	if webMode && !streamThinkingExplicit {
+		agentStreamThinking = true
 	}
-	cancel()
+	// ---------------------------------------------------------------------
 
-	// Register whatever tools you want the model to have access to.
-	// See harness/tools.go for the Tool interface and more examples.
-	registry := harness.NewRegistry()
-	registry.Register(tools.CurrentTimeTool{})
-	registry.Register(tools.ReadFileTool{BaseDir: "."})
-	registry.Register(tools.ListFilesTool{BaseDir: "."})
-	registry.Register(tools.ReadPartialFileTool{BaseDir: "."})
-	registry.Register(tools.GetFileSizeTool{BaseDir: "."})
-	registry.Register(tools.EditFileTool{BaseDir: "."})
-	registry.Register(tools.WriteFileTool{BaseDir: "."})
-	registry.Register(tools.ShellTool{BaseDir: "."})
-	// Web tools (roadmap 2.3) are read-only, so the default PolicyAllow
-	// applies; config's tool-permissions lists can still gate them via
-	// applyToolPolicies below.
-	registry.Register(tools.WebFetchTool{})
-	registry.Register(tools.WebSearchTool{})
-	bdotools.RegisterMarketTools(registry)
+	conf := config.GetConfig()
+	core := setupAgent(harness.StrataConfig(), conf, agentStreamThinking)
 
-	// MCP tool servers (roadmap 2.2): spawn each configured server over
-	// stdio and register its discovered tools. A failing server is a
-	// warning, never a startup abort. The MCP tools keep the Registry's
-	// zero-value PolicyAllow, but that is the same default applyToolPolicies
-	// below encodes for unlisted names, and any explicit
-	// tool-permissions entry for an MCP tool name still wins, because
-	// ApplyPolicies is keyed purely by name.
-	var mcpClients []*mcp.Client
+	// The MCP server processes live as long as the process: setupAgent
+	// hands the clients back instead of deferring inside itself, so the
+	// same defer terminates them on exit from BOTH the REPL and the web
+	// path.
 	defer func() {
-		for _, c := range mcpClients {
+		for _, c := range core.MCPClients {
 			_ = c.Close() // also terminates the server process
 		}
 	}()
-	// Bounded startup so an MCP server that never answers tools/list
-	// can't hang the REPL; the registered tools use their own context
-	// at call time, so this one is cancelled once startup finishes.
-	ctx0, cancelMCPStartup := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancelMCPStartup()
-	for _, srv := range conf.MCPServers {
-		client, _, err := mcp.StartServer(srv.Command, srv.Args, nil)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to start MCP server %q (%s): %v\n", srv.Name, srv.Command, err)
-			continue
+
+	if webMode {
+		// Same banner style as the REPL, minus the 'exit' hint (there is
+		// no prompt here), plus where the UI is reachable. web.Serve is a
+		// stub until the follow-up web tasks land (web/config.go).
+		fmt.Printf("ai-harness ready - model %q at %s\n", core.Cfg.Model, core.Cfg.BaseURL)
+		fmt.Printf("Persistent memory: %s\n", core.MemFile)
+		fmt.Printf("Web UI listening on %s:%d\n", *serverAddr, *webPort)
+		if err := web.Serve(web.Config{
+			BindAddr:      *serverAddr,
+			Port:          *webPort,
+			Username:      *webUser,
+			Password:      *webPass,
+			Base:          core.Cfg,
+			Conf:          conf,
+			Client:        core.Client,
+			Registry:      core.Registry,
+			Harness:       core.Harness,
+			MemFile:       core.MemFile,
+			CustomToolDir: core.CustomDir,
+			MCPClients:    core.MCPClients,
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "web error: %v\n", err)
+			os.Exit(1)
 		}
-		mcpClients = append(mcpClients, client)
-		n, err := mcp.LoadTools(ctx0, client, registry, srv.Name)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to load tools from MCP server %q: %v\n", srv.Name, err)
-			continue
-		}
-		fmt.Printf("Loaded %d MCP tools from server %q\n", n, srv.Name)
+		return
 	}
 
-	// Permission policies (roadmap 1.2): config.yaml's tool-permissions
-	// lists plus a default ask for run_shell_command. applyToolPolicies
-	// runs again on hot-reload below, so config edits take effect
-	// without restarting the REPL.
-	applyToolPolicies(conf, registry)
-
-	// --- Dynamic Custom Lua Tools Loader -------------------------------
-	defaultConfigDir := "agent/custom_tools"
-	if conf.CustomToolDir != "" {
-		defaultConfigDir = conf.CustomToolDir
-	}
-	customToolsDir := defaultConfigDir
-	entries, err := os.ReadDir(customToolsDir)
-	if err != nil {
-		fmt.Printf("Note: Skipping custom Lua tools (could not read directory %q: %v)\n", customToolsDir, err)
-	} else {
-		for _, entry := range entries {
-			// Skip subdirectories and non-Lua files
-			if entry.IsDir() || filepath.Ext(entry.Name()) != ".lua" {
-				continue
-			}
-
-			scriptPath := filepath.Join(customToolsDir, entry.Name())
-			data, err := os.ReadFile(scriptPath)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: failed to read custom tool %s: %v\n", scriptPath, err)
-				continue
-			}
-
-			tool, err := luatool.NewLuaToolFromScriptWithConfig(string(data), luatool.FilesystemConfig{BaseDir: "."})
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: failed to parse Lua tool %s: %v\n", scriptPath, err)
-				continue
-			}
-
-			registry.Register(tool)
-			fmt.Printf("Loaded custom Lua tool: %s\n", entry.Name())
-		}
-	}
-
-	cfg.StreamThinking = *streamThinking
-
-	// Persistent memory (roadmap 2.4): config.yaml's memory-file picks
-	// the store; an EMPTY value still defaults to agent/memory.md for
-	// the REPL. Workflows never set harness Config.Memory, so they stay
-	// memory-free. The remember tool is registered at the Registry's
-	// zero-value PolicyAllow; any explicit tool-permissions entry for
-	// "remember" still wins, because ApplyPolicies is keyed by name.
-	memFile := conf.MemoryFile
-	if memFile == "" {
-		memFile = "agent/memory.md"
-	}
-	cfg.Memory = &harness.Memory{Path: memFile}
-
-	h := harness.New(cfg, client, registry)
-	registry.Register(harness.RememberTool{H: h})
+	// The REPL keeps its own Config copy (handleCommand's /model writes
+	// cfg.Model alongside h.Config.Model so the startup-only cfg never
+	// goes stale) plus the shared handles setupAgent built.
+	cfg := core.Cfg
+	registry := core.Registry
+	h := core.Harness
+	memFile := core.MemFile
+	customToolsDir := core.CustomDir
 
 	// The REPL's stdin scanner, created before h.Confirm below so the
 	// confirmation prompt can share it (Confirm and the prompt loop
@@ -303,6 +264,175 @@ func main() {
 			fmt.Printf("[context: %d prompt + %d completion = %d tokens]\n",
 				h.LastUsage.PromptTokens, h.LastUsage.CompletionTokens, h.LastUsage.TotalTokens)
 		}
+	}
+}
+
+// agentCore bundles the shared agent bootstrap that BOTH front-ends need:
+// the terminal REPL in main() and the browser UI behind web.Serve
+// (web/config.go). setupAgent builds it; the CALLER owns the MCP client
+// lifetime (defer c.Close() in main) so the server processes die on exit
+// from either path.
+type agentCore struct {
+	Cfg        harness.Config
+	Client     *harness.Client
+	Registry   *harness.Registry
+	Harness    *harness.Harness
+	MCPClients []*mcp.Client
+
+	// MemFile is the resolved persistent-memory path (config.yaml's
+	// memory-file, defaulting to agent/memory.md) and CustomDir the
+	// resolved custom Lua tool directory (config.yaml's custom-tool-dir,
+	// defaulting to agent/custom_tools) - both surfaced for status
+	// output and the REPL's hot-reload loop.
+	MemFile   string
+	CustomDir string
+}
+
+// setupAgent runs the full agent bootstrap for a given base Config
+// preset (harness.StrataConfig today; the web settings UI may hand a
+// different preset later), the viper conf from config.GetConfig, and the
+// --stream-thinking default. It creates the Client, probes the model's
+// real context window, registers the built-in/BDO/MCP/custom-Lua tools,
+// applies config.yaml's permission policies, attaches the memory store,
+// and constructs the Harness with its remember tool. Every startup
+// message, warning, default and timeout is exactly what main() used to
+// do inline - keep them byte-for-byte when editing. conf stays the
+// caller's pointer so the REPL's hot-reload block (viper repopulates it
+// in place) and web's policy reload share one Config.
+func setupAgent(base harness.Config, conf *config.Config, streamThinking bool) *agentCore {
+	cfg := base
+
+	// --- Edit these to point at a different model/server -------------
+	// cfg.Model = "qwen2.5:14b"
+	// cfg.BaseURL = "http://localhost:8080/v1" // e.g. llama.cpp server
+	// cfg.Temperature = 0.2
+	// -------------------------------------------------------------------
+
+	client := harness.NewClient(cfg.BaseURL, cfg.APIKey)
+
+	// Ask the server for this model's real context window rather than
+	// guessing. This only works against Ollama's native /api/show
+	// endpoint - if it fails (different server, model not pulled yet,
+	// etc.) we just skip the percentage display below.
+	ctxProbe, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if n, err := client.ContextLength(ctxProbe, cfg.Model); err == nil {
+		cfg.MaxContextTokens = n
+	}
+	cancel()
+
+	// Register whatever tools you want the model to have access to.
+	// See harness/tools.go for the Tool interface and more examples.
+	registry := harness.NewRegistry()
+	registry.Register(tools.CurrentTimeTool{})
+	registry.Register(tools.ReadFileTool{BaseDir: "."})
+	registry.Register(tools.ListFilesTool{BaseDir: "."})
+	registry.Register(tools.ReadPartialFileTool{BaseDir: "."})
+	registry.Register(tools.GetFileSizeTool{BaseDir: "."})
+	registry.Register(tools.EditFileTool{BaseDir: "."})
+	registry.Register(tools.WriteFileTool{BaseDir: "."})
+	registry.Register(tools.ShellTool{BaseDir: "."})
+	// Web tools (roadmap 2.3) are read-only, so the default PolicyAllow
+	// applies; config's tool-permissions lists can still gate them via
+	// applyToolPolicies below.
+	registry.Register(tools.WebFetchTool{})
+	registry.Register(tools.WebSearchTool{})
+	bdotools.RegisterMarketTools(registry)
+
+	// MCP tool servers (roadmap 2.2): spawn each configured server over
+	// stdio and register its discovered tools. A failing server is a
+	// warning, never a startup abort. The MCP tools keep the Registry's
+	// zero-value PolicyAllow, but that is the same default applyToolPolicies
+	// below encodes for unlisted names, and any explicit
+	// tool-permissions entry for an MCP tool name still wins, because
+	// ApplyPolicies is keyed purely by name.
+	// The clients are returned (agentCore.MCPClients) and closed by the
+	// caller, so both the REPL and the web path terminate the processes.
+	var mcpClients []*mcp.Client
+	// Bounded startup so an MCP server that never answers tools/list
+	// can't hang the REPL; the registered tools use their own context
+	// at call time, so this one is cancelled once startup finishes.
+	ctx0, cancelMCPStartup := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelMCPStartup()
+	for _, srv := range conf.MCPServers {
+		client, _, err := mcp.StartServer(srv.Command, srv.Args, nil)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to start MCP server %q (%s): %v\n", srv.Name, srv.Command, err)
+			continue
+		}
+		mcpClients = append(mcpClients, client)
+		n, err := mcp.LoadTools(ctx0, client, registry, srv.Name)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to load tools from MCP server %q: %v\n", srv.Name, err)
+			continue
+		}
+		fmt.Printf("Loaded %d MCP tools from server %q\n", n, srv.Name)
+	}
+
+	// Permission policies (roadmap 1.2): config.yaml's tool-permissions
+	// lists plus a default ask for run_shell_command. applyToolPolicies
+	// runs again on hot-reload below, so config edits take effect
+	// without restarting the REPL.
+	applyToolPolicies(conf, registry)
+
+	// --- Dynamic Custom Lua Tools Loader -------------------------------
+	defaultConfigDir := "agent/custom_tools"
+	if conf.CustomToolDir != "" {
+		defaultConfigDir = conf.CustomToolDir
+	}
+	customToolsDir := defaultConfigDir
+	entries, err := os.ReadDir(customToolsDir)
+	if err != nil {
+		fmt.Printf("Note: Skipping custom Lua tools (could not read directory %q: %v)\n", customToolsDir, err)
+	} else {
+		for _, entry := range entries {
+			// Skip subdirectories and non-Lua files
+			if entry.IsDir() || filepath.Ext(entry.Name()) != ".lua" {
+				continue
+			}
+
+			scriptPath := filepath.Join(customToolsDir, entry.Name())
+			data, err := os.ReadFile(scriptPath)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to read custom tool %s: %v\n", scriptPath, err)
+				continue
+			}
+
+			tool, err := luatool.NewLuaToolFromScriptWithConfig(string(data), luatool.FilesystemConfig{BaseDir: "."})
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to parse Lua tool %s: %v\n", scriptPath, err)
+				continue
+			}
+
+			registry.Register(tool)
+			fmt.Printf("Loaded custom Lua tool: %s\n", entry.Name())
+		}
+	}
+
+	cfg.StreamThinking = streamThinking
+
+	// Persistent memory (roadmap 2.4): config.yaml's memory-file picks
+	// the store; an EMPTY value still defaults to agent/memory.md for
+	// the REPL. Workflows never set harness Config.Memory, so they stay
+	// memory-free. The remember tool is registered at the Registry's
+	// zero-value PolicyAllow; any explicit tool-permissions entry for
+	// "remember" still wins, because ApplyPolicies is keyed by name.
+	memFile := conf.MemoryFile
+	if memFile == "" {
+		memFile = "agent/memory.md"
+	}
+	cfg.Memory = &harness.Memory{Path: memFile}
+
+	h := harness.New(cfg, client, registry)
+	registry.Register(harness.RememberTool{H: h})
+
+	return &agentCore{
+		Cfg:        cfg,
+		Client:     client,
+		Registry:   registry,
+		Harness:    h,
+		MCPClients: mcpClients,
+		MemFile:    memFile,
+		CustomDir:  customToolsDir,
 	}
 }
 
